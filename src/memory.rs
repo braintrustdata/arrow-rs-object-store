@@ -30,8 +30,8 @@ use crate::multipart::{MultipartStore, PartId};
 use crate::util::InvalidGetRange;
 use crate::{
     path::Path, Attributes, DeleteOptions, GetRange, GetResult, GetResultPayload, ListResult,
-    MultipartId, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOpts,
-    PutOptions, PutResult, Result, UpdateVersion, UploadPart,
+    MultipartId, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOpts, PutOptions,
+    PutResult, Result, UpdateVersion, UploadPart,
 };
 use crate::{GetOptions, PutPayload};
 
@@ -575,6 +575,8 @@ mod tests {
         copy_if_not_exists(&integration).await;
         stream_get(&integration).await;
         put_opts(&integration, true).await;
+        delete_opts(&integration, true).await;
+        delete_opts_race_condition(&integration, true).await;
         multipart(&integration, &integration).await;
         put_get_attributes(&integration).await;
     }
