@@ -47,6 +47,7 @@ use http::{HeaderName, Method, StatusCode};
 use percent_encoding::{percent_encode, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::Instrument;
 
 const VERSION_HEADER: &str = "x-goog-generation";
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
@@ -627,7 +628,10 @@ impl GetClient for GoogleCloudStorageClient {
         path: &Path,
         options: GetOptions,
     ) -> Result<HttpResponse> {
-        let credential = self.get_credential().await?;
+        let credential = self
+            .get_credential()
+            .instrument(tracing::info_span!("gcs.get_credential"))
+            .await?;
         let url = self.object_url(path);
 
         let method = match options.head {
@@ -646,6 +650,7 @@ impl GetClient for GoogleCloudStorageClient {
             .with_get_options(options)
             .retryable_request()
             .send(ctx)
+            .instrument(tracing::info_span!("gcs.send_request"))
             .await
             .map_err(|source| {
                 let path = path.as_ref().into();
