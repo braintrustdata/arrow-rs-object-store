@@ -724,7 +724,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
                 self.delete(&location).await?;
                 Ok(location)
             })
-            .buffered(10)
+            .buffered(1000)
             .boxed()
     }
 
