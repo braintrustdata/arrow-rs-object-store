@@ -421,13 +421,24 @@ impl RetryableRequest {
                         };
 
                         let sleep = ctx.backoff();
-                        info!(
-                            "Encountered server error with status {}, backing off for {} seconds, retry {} of {}",
-                            status,
-                            sleep.as_secs_f32(),
-                            ctx.retries,
-                            ctx.max_retries,
-                        );
+                        // Use debug level until retries reach 80% of max_retries
+                        if ctx.retries * 100 >= ctx.max_retries * 80 {
+                            info!(
+                                "Encountered server error with status {}, backing off for {} seconds, retry {} of {}",
+                                status,
+                                sleep.as_secs_f32(),
+                                ctx.retries,
+                                ctx.max_retries,
+                            );
+                        } else {
+                            debug!(
+                                "Encountered server error with status {}, backing off for {} seconds, retry {} of {}",
+                                status,
+                                sleep.as_secs_f32(),
+                                ctx.retries,
+                                ctx.max_retries,
+                            );
+                        }
                         tokio::time::sleep(sleep).await;
                     }
                 }
