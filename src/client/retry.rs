@@ -27,7 +27,7 @@ use reqwest::StatusCode;
 use reqwest::header::LOCATION;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{debug, info};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{Duration, Instant};
 
@@ -446,14 +446,27 @@ impl RetryableRequest {
                         return Err(self.err(RequestError::Http(e), ctx));
                     }
                     let sleep = ctx.backoff();
-                    info!(
-                        "Encountered transport error of kind {:?}, backing off for {} seconds, retry {} of {}: {}",
-                        e.kind(),
-                        sleep.as_secs_f32(),
-                        ctx.retries,
-                        ctx.max_retries,
-                        e,
-                    );
+
+                    // Use debug level until retries reach 80% of max_retries
+                    if ctx.retries * 100 >= ctx.max_retries * 80 {
+                        info!(
+                            "Encountered transport error of kind {:?}, backing off for {} seconds, retry {} of {}: {}",
+                            e.kind(),
+                            sleep.as_secs_f32(),
+                            ctx.retries,
+                            ctx.max_retries,
+                            e,
+                        );
+                    } else {
+                        debug!(
+                            "Encountered transport error of kind {:?}, backing off for {} seconds, retry {} of {}: {}",
+                            e.kind(),
+                            sleep.as_secs_f32(),
+                            ctx.retries,
+                            ctx.max_retries,
+                            e,
+                        );
+                    }
                     tokio::time::sleep(sleep).await;
                 }
             }
