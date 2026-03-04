@@ -1205,10 +1205,12 @@ pub(crate) struct UserDelegationKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::mock_server::MockServer;
     use crate::StaticCredentialProvider;
     use bytes::Bytes;
+    use http::Response;
     use regex::bytes::Regex;
-    use reqwest::Client;
+    use reqwest::{Client, Method};
 
     #[test]
     fn deserde_azure() {
@@ -1551,5 +1553,54 @@ Time:2018-06-14T16:46:54.6040685Z</Message></Error>\r
         assert_eq!(paths[2].as_ref(), path);
         assert_eq!("404", code);
         assert_eq!("The specified blob does not exist.", reason);
+    }
+
+    async fn assert_create_conflict_status_is_mapped(status: http::StatusCode) {
+        let server = MockServer::new().await;
+        server.push_fn(move |req| {
+            assert_eq!(req.method(), Method::PUT);
+            assert_eq!(req.headers().get(IF_NONE_MATCH).unwrap(), "*");
+            Response::builder()
+                .status(status)
+                .body(String::new())
+                .unwrap()
+        });
+
+        let credential_provider = Arc::new(StaticCredentialProvider::new(
+            AzureCredential::BearerToken("static-token".to_string()),
+        ));
+
+        let config = AzureConfig {
+            account: "testaccount".to_string(),
+            container: "testcontainer".to_string(),
+            credentials: credential_provider,
+            service: server.url().try_into().unwrap(),
+            retry_config: Default::default(),
+            is_emulator: false,
+            skip_signature: true,
+            disable_tagging: false,
+            client_options: Default::default(),
+        };
+
+        let client = AzureClient::new(config, HttpClient::new(Client::new()));
+        let path = Path::from("already-exists");
+
+        let err = client
+            .put_blob(&path, "test".into(), PutMode::Create.into())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, crate::Error::AlreadyExists { .. }), "{err}");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_put_blob_create_maps_precondition_to_already_exists() {
+        assert_create_conflict_status_is_mapped(http::StatusCode::PRECONDITION_FAILED).await;
+    }
+
+    #[tokio::test]
+    async fn test_put_blob_create_maps_not_modified_to_already_exists() {
+        assert_create_conflict_status_is_mapped(http::StatusCode::NOT_MODIFIED).await;
     }
 }
