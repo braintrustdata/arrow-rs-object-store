@@ -70,6 +70,15 @@ jobs:
           cargo update -p tracing --precise 0.1.41
           cargo update -p tracing-core --precise 0.1.33
           cargo update -p tracing-attributes --precise 0.1.28
+          cargo update -p futures --precise 0.3.31
+          cargo update -p futures-channel --precise 0.3.31
+          cargo update -p futures-core --precise 0.3.31
+          cargo update -p futures-executor --precise 0.3.31
+          cargo update -p futures-io --precise 0.3.31
+          cargo update -p futures-macro --precise 0.3.31
+          cargo update -p futures-sink --precise 0.3.31
+          cargo update -p futures-task --precise 0.3.31
+          cargo update -p futures-util --precise 0.3.31
       - name: Check
         run: |
           # run `cargo msrv verify` to see problems
