@@ -54,7 +54,7 @@ impl<T> Default for TokenCache<T> {
     }
 }
 
-impl<T: Clone + Send> TokenCache<T> {
+impl<T: Clone + Send + Sync> TokenCache<T> {
     /// Override the minimum remaining TTL for a cached token to be used
     #[cfg(any(feature = "aws", feature = "gcp"))]
     pub(crate) fn with_min_ttl(self, min_ttl: Duration) -> Self {
@@ -157,6 +157,7 @@ mod test {
     async fn test_min_ttl_causes_refresh() {
         let cache = TokenCache {
             cache: Default::default(),
+            refresh_lock: Default::default(),
             min_ttl: Duration::from_secs(1),
             fetch_backoff: Duration::from_millis(1),
         };
