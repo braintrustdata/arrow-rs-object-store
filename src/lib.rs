@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![warn(
     missing_copy_implementations,
@@ -128,7 +128,7 @@
 //! to support a wide variety of user-defined store configurations, with minimal additional
 //! application complexity.
 //!
-//! ```no_run
+//! ```no_run,ignore-wasm32
 //! # #[cfg(feature = "aws")] {
 //! # use url::Url;
 //! # use object_store::{parse_url, parse_url_opts};
@@ -163,7 +163,7 @@
 //! Use the [`ObjectStore::list`] method to iterate over objects in
 //! remote storage or files in the local filesystem:
 //!
-//! ```
+//! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
 //! # use std::sync::Arc;
 //! # use object_store::{path::Path, ObjectStore};
@@ -207,7 +207,7 @@
 //! Use the [`ObjectStore::get`] method to fetch the data bytes
 //! from remote storage or files in the local filesystem as a stream.
 //!
-//! ```
+//! ```ignore-wasm32
 //! # use futures::TryStreamExt;
 //! # use object_store::local::LocalFileSystem;
 //! # use std::sync::Arc;
@@ -254,7 +254,7 @@
 //!
 //! Use the [`ObjectStore::put`] method to atomically write data.
 //!
-//! ```
+//! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
 //! # use object_store::{ObjectStore, PutPayload};
 //! # use std::sync::Arc;
@@ -275,7 +275,7 @@
 //!
 //! Use the [`ObjectStore::put_multipart`] method to atomically write a large amount of data
 //!
-//! ```
+//! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
 //! # use object_store::{ObjectStore, WriteMultipart};
 //! # use std::sync::Arc;
@@ -304,7 +304,7 @@
 //! [`ObjectStore::get_ranges`] provides an efficient way to perform such vectored IO, and will
 //! automatically coalesce adjacent ranges into an appropriate number of parallel requests.
 //!
-//! ```
+//! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
 //! # use object_store::ObjectStore;
 //! # use std::sync::Arc;
@@ -336,7 +336,7 @@
 //! possible to instead allocate memory in chunks and avoid bump allocating. [`PutPayloadMut`]
 //! encapsulates this approach
 //!
-//! ```
+//! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
 //! # use object_store::{ObjectStore, PutPayloadMut};
 //! # use std::sync::Arc;
@@ -567,6 +567,9 @@ pub use payload::*;
 pub use upload::*;
 pub use util::{coalesce_ranges, collect_bytes, GetRange, OBJECT_STORE_COALESCE_DEFAULT};
 
+// Re-export HTTP types used in public API
+pub use ::http::{Extensions, HeaderMap, HeaderValue};
+
 use crate::path::Path;
 #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 use crate::util::maybe_spawn_blocking;
@@ -690,7 +693,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// filesystems, GCP, and Azure return an error, while S3 and in-memory will
     /// return Ok. If it is an error, it will be [`Error::NotFound`].
     ///
-    /// ```
+    /// ```ignore-wasm32
     /// # use futures::{StreamExt, TryStreamExt};
     /// # use object_store::local::LocalFileSystem;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -987,7 +990,7 @@ pub struct GetOptions {
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
     /// These extensions are ignored entirely by backends offered through this crate.
-    pub extensions: ::http::Extensions,
+    pub extensions: Extensions,
 }
 
 impl GetOptions {
@@ -1184,7 +1187,7 @@ pub struct PutOptions {
     /// These extensions are ignored entirely by backends offered through this crate.
     ///
     /// They are also eclused from [`PartialEq`] and [`Eq`].
-    pub extensions: ::http::Extensions,
+    pub extensions: Extensions,
 }
 
 impl PartialEq<Self> for PutOptions {
@@ -1256,7 +1259,7 @@ pub struct PutMultipartOptions {
     /// These extensions are ignored entirely by backends offered through this crate.
     ///
     /// They are also eclused from [`PartialEq`] and [`Eq`].
-    pub extensions: ::http::Extensions,
+    pub extensions: Extensions,
 }
 
 impl PartialEq<Self> for PutMultipartOptions {
@@ -1648,5 +1651,23 @@ mod tests {
         options = GetOptions::default();
         options.if_match = Some("*".to_string()); // Passes if file exists
         options.check_preconditions(&meta).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn test_reexported_types() {
+        // Test HeaderMap
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        assert_eq!(headers.len(), 1);
+
+        // Test HeaderValue
+        let value = HeaderValue::from_static("test-value");
+        assert_eq!(value.as_bytes(), b"test-value");
+
+        // Test Extensions
+        let mut extensions = Extensions::new();
+        extensions.insert("test-key");
+        assert!(extensions.get::<&str>().is_some());
     }
 }
