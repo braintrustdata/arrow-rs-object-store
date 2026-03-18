@@ -706,7 +706,7 @@ impl ClientOptions {
         builder = builder.no_gzip().no_brotli().no_zstd().no_deflate();
 
         if self.randomize_addresses.get()? {
-            builder = builder.dns_resolver(Arc::new(dns::ShuffleResolver));
+            builder = builder.dns_resolver(Arc::new(dns::ShuffleResolver::default()));
         }
 
         builder

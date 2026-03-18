@@ -48,13 +48,14 @@ arc-swap = "1.7"
 # Cloud storage support
 base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
 form_urlencoded = { version = "1.2", optional = true }
+hickory-resolver = { version = "0.25", optional = true }
 http-body-util = { version = "0.1.2", optional = true }
 httparse = { version = "1.8.0", default-features = false, features = ["std"], optional = true }
 hyper = { version = "1.2", default-features = false, optional = true }
 md-5 = { version = "0.10.6", default-features = false, optional = true }
 quick-xml = { version = "0.38.0", features = ["serialize", "overlapped-lists"], optional = true }
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2", "hickory-dns"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"], optional = true }
 ring = { version = "0.17", default-features = false, features = ["std"], optional = true }
 rustls-pemfile = { version = "2.0", default-features = false, features = ["std"], optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
@@ -76,6 +77,7 @@ azure = ["cloud", "httparse"]
 fs = ["walkdir"]
 gcp = ["cloud", "rustls-pemfile"]
 aws = ["cloud", "md-5"]
+hickory-dns = ["dep:hickory-resolver", "reqwest?/hickory-dns"]
 http = ["cloud"]
 tls-webpki-roots = ["reqwest?/rustls-tls-webpki-roots"]
 integration = ["rand"]
