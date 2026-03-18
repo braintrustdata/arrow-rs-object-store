@@ -1567,7 +1567,10 @@ Time:2018-06-14T16:46:54.6040685Z</Message></Error>\r
         server.push_fn(move |req| {
             assert_eq!(req.method(), Method::PUT);
             assert_eq!(req.headers().get(IF_NONE_MATCH).unwrap(), "*");
-            Response::builder().status(status).body(String::new()).unwrap()
+            Response::builder()
+                .status(status)
+                .body(String::new())
+                .unwrap()
         });
 
         let credential_provider = Arc::new(StaticCredentialProvider::new(
