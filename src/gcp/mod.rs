@@ -195,7 +195,8 @@ impl ObjectStore for GoogleCloudStorage {
                     Ok(location)
                 }
             })
-            .buffered(10)
+            // bulk deletes are not supported, increase concurrency from 10 to 1000
+            .buffered(1000)
             .boxed()
     }
 
