@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(not(feature = "hickory-dns"))]
 use std::net::ToSocketAddrs;
-#[cfg(feature = "hickory-dns")]
 use std::sync::Arc;
 
 #[cfg(feature = "hickory-dns")]
@@ -26,34 +24,28 @@ use rand::prelude::SliceRandom;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 #[cfg(feature = "hickory-dns")]
 use tokio::sync::OnceCell;
-#[cfg(not(feature = "hickory-dns"))]
 use tokio::task::JoinSet;
 
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Default)]
-pub(crate) struct ShuffleResolver {
-    #[cfg(feature = "hickory-dns")]
-    hickory: Arc<OnceCell<TokioResolver>>,
-}
+pub(crate) struct ShuffleResolver;
 
 impl Resolve for ShuffleResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        #[cfg(feature = "hickory-dns")]
-        {
-            return self.resolve_hickory(name);
-        }
-
-        #[cfg(not(feature = "hickory-dns"))]
-        {
-            resolve_socket_addrs(name)
-        }
+        resolve_socket_addrs(name)
     }
 }
 
 #[cfg(feature = "hickory-dns")]
-impl ShuffleResolver {
-    fn resolve_hickory(&self, name: Name) -> Resolving {
+#[derive(Debug, Default)]
+pub(crate) struct HickoryShuffleResolver {
+    hickory: Arc<OnceCell<TokioResolver>>,
+}
+
+#[cfg(feature = "hickory-dns")]
+impl Resolve for HickoryShuffleResolver {
+    fn resolve(&self, name: Name) -> Resolving {
         let resolver = Arc::clone(&self.hickory);
 
         Box::pin(async move {
@@ -80,7 +72,6 @@ impl ShuffleResolver {
     }
 }
 
-#[cfg(not(feature = "hickory-dns"))]
 fn resolve_socket_addrs(name: Name) -> Resolving {
     Box::pin(async move {
         // use `JoinSet` to propagate cancelation
