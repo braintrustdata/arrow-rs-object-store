@@ -36,7 +36,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Setup Clippy
         run: rustup component add clippy
       # Run different tests for the library on its own as well as
@@ -71,7 +71,7 @@ jobs:
     env:
       RUSTDOCFLAGS: "-Dwarnings"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Run cargo doc
         run: cargo doc --document-private-items --no-deps --all-features
 
@@ -107,7 +107,7 @@ jobs:
       GOOGLE_SERVICE_ACCOUNT: "/tmp/gcs.json"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       # We are forced to use docker commands instead of service containers as we need to override the entrypoints
       # which is currently not supported - https://github.com/actions/runner/discussions/1872
@@ -183,7 +183,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           submodules: true
       - name: Install clang (needed for ring)
@@ -198,7 +198,7 @@ jobs:
         run: cargo build --all-features --target wasm32-wasip1
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: 20
       - name: Run wasm32-unknown-unknown tests (via Node)
@@ -208,7 +208,7 @@ jobs:
     name: cargo test LocalFileSystem (win64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           submodules: true
       - name: Run LocalFileSystem tests
