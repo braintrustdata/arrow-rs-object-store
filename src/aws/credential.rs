@@ -563,6 +563,7 @@ async fn instance_creds(
 ) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
     const CREDENTIALS_PATH: &str = "latest/meta-data/iam/security-credentials";
     const AWS_EC2_METADATA_TOKEN_HEADER: &str = "X-aws-ec2-metadata-token";
+    let start = Instant::now();
 
     let token_url = format!("{endpoint}/latest/api/token");
 
@@ -612,6 +613,16 @@ async fn instance_creds(
 
     let now = Utc::now();
     let ttl = (creds.expiration - now).to_std().unwrap_or_default();
+    let elapsed = start.elapsed();
+    if elapsed > Duration::from_millis(100) {
+        warn!(
+            endpoint,
+            fetch_ms = elapsed.as_millis(),
+            ttl_s = ttl.as_secs(),
+            "instance metadata credential refresh was slow ({:?})",
+            elapsed
+        );
+    }
     Ok(TemporaryToken {
         token: Arc::new(creds.into()),
         expiry: Some(Instant::now() + ttl),
@@ -658,6 +669,7 @@ async fn web_identity(
     session_name: &str,
     endpoint: &str,
 ) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
+    let start = Instant::now();
     let token = std::fs::read_to_string(token_path)
         .map_err(|e| format!("Failed to read token file '{token_path}': {e}"))?;
 
@@ -686,6 +698,18 @@ async fn web_identity(
     let creds = resp.assume_role_with_web_identity_result.credentials;
     let now = Utc::now();
     let ttl = (creds.expiration - now).to_std().unwrap_or_default();
+    let elapsed = start.elapsed();
+    if elapsed > Duration::from_millis(100) {
+        warn!(
+            endpoint,
+            role_arn,
+            session_name,
+            fetch_ms = elapsed.as_millis(),
+            ttl_s = ttl.as_secs(),
+            "web identity credential refresh was slow ({:?})",
+            elapsed
+        );
+    }
 
     Ok(TemporaryToken {
         token: Arc::new(creds.into()),
@@ -725,6 +749,7 @@ async fn task_credential(
     retry: &RetryConfig,
     url: &str,
 ) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
+    let start = Instant::now();
     let creds: InstanceCredentials = client
         .get(url)
         .send_retry(retry)
@@ -735,6 +760,15 @@ async fn task_credential(
 
     let now = Utc::now();
     let ttl = (creds.expiration - now).to_std().unwrap_or_default();
+    let elapsed = start.elapsed();
+    if elapsed > Duration::from_millis(100) {
+        warn!(
+            url,
+            fetch_ms = elapsed.as_millis(),
+            ttl_s = ttl.as_secs(),
+            "task credential refresh was slow"
+        );
+    }
     Ok(TemporaryToken {
         token: Arc::new(creds.into()),
         expiry: Some(Instant::now() + ttl),
@@ -781,6 +815,7 @@ async fn eks_credential(
     url: &str,
     token_file: &str,
 ) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
+    let start = Instant::now();
     // Spawn IO to blocking tokio pool if running in tokio context
     let token = match tokio::runtime::Handle::try_current() {
         Ok(runtime) => {
@@ -801,6 +836,17 @@ async fn eks_credential(
 
     let now = Utc::now();
     let ttl = (creds.expiration - now).to_std().unwrap_or_default();
+    let elapsed = start.elapsed();
+    if elapsed > Duration::from_millis(100) {
+        warn!(
+            url,
+            token_file,
+            fetch_ms = elapsed.as_millis(),
+            ttl_s = ttl.as_secs(),
+            "eks pod credential refresh was slow ({:?})",
+            elapsed
+        );
+    }
 
     Ok(TemporaryToken {
         token: Arc::new(creds.into()),

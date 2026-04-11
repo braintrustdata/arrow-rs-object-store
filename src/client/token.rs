@@ -18,6 +18,7 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tracing::warn;
 
 /// A temporary authentication token with an associated expiry
 #[derive(Debug, Clone)]
@@ -78,21 +79,50 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
             })
         };
 
-        if let Some(cache) = self.cache.read().await.as_ref()
+        let read_wait_start = Instant::now();
+        let read_guard = self.cache.read().await;
+        let read_wait_elapsed = read_wait_start.elapsed();
+        if read_wait_elapsed > Duration::from_millis(100) {
+            warn!(
+                wait_ms = read_wait_elapsed.as_millis(),
+                "waited for token cache read lock"
+            );
+        }
+        if let Some(cache) = read_guard.as_ref()
             && is_token_valid(cache)
         {
             return Ok(cache.token.token.clone());
         }
+        drop(read_guard);
 
+        let write_wait_start = Instant::now();
         let mut guard = self.cache.write().await;
+        let write_wait_elapsed = write_wait_start.elapsed();
+        if write_wait_elapsed > Duration::from_millis(100) {
+            warn!(
+                wait_ms = write_wait_elapsed.as_millis(),
+                "waited for token cache write lock"
+            );
+        }
+
         if let Some(cache) = guard.as_ref()
             && is_token_valid(cache)
         {
-            // Refresh race
             return Ok(cache.token.token.clone());
         }
 
-        let cached = f().await?;
+        let fetch_start = Instant::now();
+        let fetched = f().await;
+        let fetch_elapsed = fetch_start.elapsed();
+        if fetch_elapsed > Duration::from_millis(100) {
+            warn!(
+                fetch_ms = fetch_elapsed.as_millis(),
+                success = fetched.is_ok(),
+                "temporary credential fetch was slow"
+            );
+        }
+
+        let cached = fetched?;
         let token = cached.token.clone();
         *guard = Some(CacheEntry {
             token: cached,
