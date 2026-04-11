@@ -65,6 +65,7 @@ const USER_DEFINED_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
 const ALGORITHM: &str = "x-amz-checksum-algorithm";
 const STORAGE_CLASS: &str = "x-amz-storage-class";
 const SLOW_S3_GET_CREDENTIAL_LOOKUP_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+const SLOW_S3_GET_REQUEST_PREPARATION_WARN_THRESHOLD: Duration = Duration::from_millis(100);
 const S3_GET_CREDENTIAL_LOOKUP_IN_FLIGHT_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A specialized `Error` for object store-related errors
@@ -908,7 +909,8 @@ impl GetClient for S3Client {
             );
         }
         let url = self.config.path_url(path);
-        let method = match options.head {
+        let is_head = options.head;
+        let method = match is_head {
             true => Method::HEAD,
             false => Method::GET,
         };
@@ -930,10 +932,22 @@ impl GetClient for S3Client {
             builder = builder.query(&[("versionId", v)])
         }
 
-        let response = builder
+        let prepare_start = Instant::now();
+        let request = builder
             .with_get_options(options)
             .with_aws_sigv4(credential.authorizer(), None)
-            .retryable_request()
+            .retryable_request();
+        let prepare_elapsed = prepare_start.elapsed();
+        if prepare_elapsed > SLOW_S3_GET_REQUEST_PREPARATION_WARN_THRESHOLD {
+            warn!(
+                head = is_head,
+                path = %path,
+                prepare_ms = prepare_elapsed.as_millis(),
+                "S3 GET request preparation was slow"
+            );
+        }
+
+        let response = request
             .send(ctx)
             .await
             .map_err(|e| e.error(STORE, path.to_string()))?;

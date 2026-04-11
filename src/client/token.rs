@@ -50,6 +50,7 @@ pub(crate) struct TokenCache<T> {
     cache_id: u64,
     active_refresh_id: AtomicU64,
     active_refresh_blocked_readers: AtomicU64,
+    active_write_waiters: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -110,6 +111,7 @@ impl<T> Default for TokenCache<T> {
             cache_id: NEXT_TOKEN_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             active_refresh_id: AtomicU64::new(0),
             active_refresh_blocked_readers: AtomicU64::new(0),
+            active_write_waiters: AtomicU64::new(0),
         }
     }
 }
@@ -125,6 +127,14 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
     fn with_max_cache_age(self, max_cache_age: Option<Duration>) -> Self {
         Self {
             max_cache_age,
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    fn with_fetch_backoff(self, fetch_backoff: Duration) -> Self {
+        Self {
+            fetch_backoff,
             ..self
         }
     }
@@ -145,6 +155,7 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
                     refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
                     blocked_reader_count =
                         self.active_refresh_blocked_readers.load(Ordering::Relaxed),
+                    waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
                     elapsed_ms = elapsed.as_millis(),
                     "token cache read lock wait still in flight"
                 );
@@ -164,6 +175,7 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
                 cache_id = self.cache_id,
                 refresh_id,
                 blocked_reader_count,
+                waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
                 wait_ms = read_wait_elapsed.as_millis(),
                 "waited for token cache read lock"
             );
@@ -186,21 +198,25 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
 
         let write_wait_start = Instant::now();
         let write_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
+        self.active_write_waiters.fetch_add(1, Ordering::Relaxed);
         let mut guard = self
             .await_with_periodic_warn(self.cache.write(), |elapsed| {
                 warn!(
                     cache_id = self.cache_id,
                     wait_id = write_wait_id,
                     refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                    waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
                     elapsed_ms = elapsed.as_millis(),
                     "token cache write lock wait still in flight"
                 );
             })
             .await;
+        self.active_write_waiters.fetch_sub(1, Ordering::Relaxed);
         let write_wait_elapsed = write_wait_start.elapsed();
         if write_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
             warn!(
                 cache_id = self.cache_id,
+                waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
                 wait_ms = write_wait_elapsed.as_millis(),
                 "waited for token cache write lock"
             );
@@ -223,19 +239,6 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
 
         let refresh_reason = self.refresh_reason(guard.as_ref(), now);
         let refresh_id = NEXT_REFRESH_ID.fetch_add(1, Ordering::Relaxed);
-        let cached_age_ms = guard
-            .as_ref()
-            .map(|entry| entry.fetched_at.elapsed().as_millis());
-        let cached_ttl_remaining_ms =
-            guard
-                .as_ref()
-                .and_then(|entry| entry.token.expiry)
-                .map(|expiry| {
-                    expiry
-                        .checked_duration_since(now)
-                        .unwrap_or_default()
-                        .as_millis()
-                });
         self.active_refresh_blocked_readers
             .store(0, Ordering::Relaxed);
         self.active_refresh_id.store(refresh_id, Ordering::Relaxed);
@@ -243,8 +246,19 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
             cache_id = self.cache_id,
             refresh_id,
             reason = refresh_reason.as_str(),
-            cached_age_ms,
-            cached_ttl_remaining_ms,
+            cached_age_ms = guard
+                .as_ref()
+                .map(|entry| entry.fetched_at.elapsed().as_millis()),
+            cached_ttl_remaining_ms = guard
+                .as_ref()
+                .and_then(|entry| entry.token.expiry)
+                .map(|expiry| {
+                    expiry
+                        .checked_duration_since(now)
+                        .unwrap_or_default()
+                        .as_millis()
+                }),
+            holding_cache_write_lock = true,
             "starting temporary credential refresh"
         );
         let fetch_start = Instant::now();
@@ -256,6 +270,8 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
                     reason = refresh_reason.as_str(),
                     blocked_reader_count =
                         self.active_refresh_blocked_readers.load(Ordering::Relaxed),
+                    waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
+                    holding_cache_write_lock = true,
                     elapsed_ms = elapsed.as_millis(),
                     "temporary credential fetch still in flight"
                 );
@@ -274,17 +290,17 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
                 fetch_ms = fetch_elapsed.as_millis(),
                 success = fetched.is_ok(),
                 blocked_reader_count,
+                waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
+                holding_cache_write_lock = true,
                 "temporary credential fetch finished"
             );
         }
-
         let cached = fetched?;
         let token = cached.token.clone();
         *guard = Some(CacheEntry {
             token: cached,
             fetched_at: Instant::now(),
         });
-
         Ok(token)
     }
 
@@ -297,8 +313,6 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
         }
         entry.token.expiry.is_none_or(|ttl| {
             ttl.checked_duration_since(now).unwrap_or_default() > self.min_ttl ||
-            // if we've recently attempted to fetch this token and it's not actually
-            // expired, we'll wait to re-fetch it and return the cached one
             (entry.fetched_at.elapsed() < self.fetch_backoff && ttl > now)
         })
     }
@@ -382,12 +396,9 @@ mod test {
 
     #[tokio::test]
     async fn test_min_ttl_causes_refresh() {
-        let cache = TokenCache {
-            cache: Default::default(),
-            min_ttl: Duration::from_secs(1),
-            fetch_backoff: Duration::from_millis(1),
-            max_cache_age: None,
-        };
+        let cache = TokenCache::default()
+            .with_min_ttl(Duration::from_secs(1))
+            .with_fetch_backoff(Duration::from_millis(1));
 
         static COUNTER: AtomicU32 = AtomicU32::new(0);
 
