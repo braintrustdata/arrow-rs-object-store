@@ -24,7 +24,9 @@ use tracing::{info, warn};
 const MAX_CACHE_AGE_ENV_VAR: &str = "OBJECT_STORE_TOKEN_CACHE_MAX_AGE_SECS";
 const TOKEN_LOCK_WAIT_WARN_THRESHOLD: Duration = Duration::from_millis(100);
 const TOKEN_FETCH_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+const TOKEN_IN_FLIGHT_WARN_INTERVAL: Duration = Duration::from_secs(5);
 static NEXT_TOKEN_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TOKEN_LOCK_WAIT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REFRESH_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A temporary authentication token with an associated expiry
@@ -134,7 +136,20 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
     {
         let now = Instant::now();
         let read_wait_start = Instant::now();
-        let read_guard = self.cache.read().await;
+        let read_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
+        let read_guard = self
+            .await_with_periodic_warn(self.cache.read(), |elapsed| {
+                warn!(
+                    cache_id = self.cache_id,
+                    wait_id = read_wait_id,
+                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                    blocked_reader_count =
+                        self.active_refresh_blocked_readers.load(Ordering::Relaxed),
+                    elapsed_ms = elapsed.as_millis(),
+                    "token cache read lock wait still in flight"
+                );
+            })
+            .await;
         let read_wait_elapsed = read_wait_start.elapsed();
         if read_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
             let refresh_id = self.active_refresh_id.load(Ordering::Relaxed);
@@ -153,6 +168,15 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
                 "waited for token cache read lock"
             );
         }
+        if read_wait_elapsed >= TOKEN_IN_FLIGHT_WARN_INTERVAL {
+            info!(
+                cache_id = self.cache_id,
+                wait_id = read_wait_id,
+                refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                wait_ms = read_wait_elapsed.as_millis(),
+                "token cache read lock acquired after long wait"
+            );
+        }
         if let Some(cache) = read_guard.as_ref()
             && self.is_token_valid(cache, now)
         {
@@ -161,13 +185,33 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
         drop(read_guard);
 
         let write_wait_start = Instant::now();
-        let mut guard = self.cache.write().await;
+        let write_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut guard = self
+            .await_with_periodic_warn(self.cache.write(), |elapsed| {
+                warn!(
+                    cache_id = self.cache_id,
+                    wait_id = write_wait_id,
+                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                    elapsed_ms = elapsed.as_millis(),
+                    "token cache write lock wait still in flight"
+                );
+            })
+            .await;
         let write_wait_elapsed = write_wait_start.elapsed();
         if write_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
             warn!(
                 cache_id = self.cache_id,
                 wait_ms = write_wait_elapsed.as_millis(),
                 "waited for token cache write lock"
+            );
+        }
+        if write_wait_elapsed >= TOKEN_IN_FLIGHT_WARN_INTERVAL {
+            info!(
+                cache_id = self.cache_id,
+                wait_id = write_wait_id,
+                refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                wait_ms = write_wait_elapsed.as_millis(),
+                "token cache write lock acquired after long wait"
             );
         }
 
@@ -204,7 +248,19 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
             "starting temporary credential refresh"
         );
         let fetch_start = Instant::now();
-        let fetched = f().await;
+        let fetched = self
+            .await_with_periodic_warn(f(), |elapsed| {
+                warn!(
+                    cache_id = self.cache_id,
+                    refresh_id,
+                    reason = refresh_reason.as_str(),
+                    blocked_reader_count =
+                        self.active_refresh_blocked_readers.load(Ordering::Relaxed),
+                    elapsed_ms = elapsed.as_millis(),
+                    "temporary credential fetch still in flight"
+                );
+            })
+            .await;
         let fetch_elapsed = fetch_start.elapsed();
         let blocked_reader_count = self
             .active_refresh_blocked_readers
@@ -261,6 +317,31 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
             return RefreshReason::Expired;
         }
         RefreshReason::MinTtl
+    }
+
+    async fn await_with_periodic_warn<F, O, L>(&self, future: F, mut log: L) -> O
+    where
+        F: Future<Output = O>,
+        L: FnMut(Duration),
+    {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            future.await
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let start = Instant::now();
+            tokio::pin!(future);
+            loop {
+                tokio::select! {
+                    output = &mut future => return output,
+                    _ = tokio::time::sleep(TOKEN_IN_FLIGHT_WARN_INTERVAL) => {
+                        log(start.elapsed());
+                    }
+                }
+            }
+        }
     }
 }
 

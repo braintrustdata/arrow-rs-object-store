@@ -65,6 +65,7 @@ const USER_DEFINED_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
 const ALGORITHM: &str = "x-amz-checksum-algorithm";
 const STORAGE_CLASS: &str = "x-amz-storage-class";
 const SLOW_S3_GET_CREDENTIAL_LOOKUP_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+const S3_GET_CREDENTIAL_LOOKUP_IN_FLIGHT_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A specialized `Error` for object store-related errors
 #[derive(Debug, thiserror::Error)]
@@ -220,13 +221,43 @@ impl S3Config {
     }
 
     async fn get_session_credential(&self) -> Result<SessionCredential<'_>> {
+        let lookup_start = Instant::now();
         let credential = match self.skip_signature {
             false => {
                 let provider = self.session_provider.as_ref().unwrap_or(&self.credentials);
-                Some(provider.get_credential().await?)
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                let credential = provider.get_credential().await?;
+
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                let credential = {
+                    let future = provider.get_credential();
+                    tokio::pin!(future);
+                    loop {
+                        tokio::select! {
+                            result = &mut future => break result?,
+                            _ = tokio::time::sleep(S3_GET_CREDENTIAL_LOOKUP_IN_FLIGHT_WARN_INTERVAL) => {
+                                warn!(
+                                    elapsed_ms = lookup_start.elapsed().as_millis(),
+                                    uses_session_provider = self.session_provider.is_some(),
+                                    "S3 session credential lookup still in flight"
+                                );
+                            }
+                        }
+                    }
+                };
+                Some(credential)
             }
             true => None,
         };
+
+        let lookup_elapsed = lookup_start.elapsed();
+        if lookup_elapsed > SLOW_S3_GET_CREDENTIAL_LOOKUP_WARN_THRESHOLD {
+            warn!(
+                lookup_ms = lookup_elapsed.as_millis(),
+                uses_session_provider = self.session_provider.is_some(),
+                "S3 session credential lookup was slow"
+            );
+        }
 
         Ok(SessionCredential {
             credential,
