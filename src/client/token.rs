@@ -18,7 +18,7 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 const MAX_CACHE_AGE_ENV_VAR: &str = "OBJECT_STORE_TOKEN_CACHE_MAX_AGE_SECS";
@@ -45,12 +45,14 @@ pub(crate) struct TemporaryToken<T> {
 #[derive(Debug)]
 pub(crate) struct TokenCache<T> {
     cache: RwLock<Option<CacheEntry<T>>>,
+    refresh: Mutex<()>,
     min_ttl: Duration,
     fetch_backoff: Duration,
     max_cache_age: Option<Duration>,
     cache_id: u64,
     active_refresh_id: AtomicU64,
-    active_refresh_blocked_readers: AtomicU64,
+    active_refresh_waiters: AtomicU64,
+    active_refresh_holder_id: AtomicU64,
     active_write_waiters: AtomicU64,
     active_read_holders: AtomicU64,
     active_write_holder_id: AtomicU64,
@@ -129,8 +131,13 @@ struct WriteLockHolder<'a> {
 impl<'a> WriteLockHolder<'a> {
     fn new(cache: &'a TokenCache<impl Clone + Send + Sync>) -> Self {
         let holder_id = NEXT_TOKEN_LOCK_HOLDER_ID.fetch_add(1, Ordering::Relaxed);
-        cache.active_write_holder_id.store(holder_id, Ordering::Relaxed);
-        cache.active_write_holder_refresh_id.store(0, Ordering::Relaxed);
+        cache
+            .active_write_holder_id
+            .store(holder_id, Ordering::Relaxed);
+        cache.active_write_holder_refresh_id.store(
+            cache.active_refresh_id.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         info!(
             cache_id = cache.cache_id,
             holder_id,
@@ -161,7 +168,56 @@ impl Drop for WriteLockHolder<'_> {
             "token cache write lock released"
         );
         self.active_write_holder_id.store(0, Ordering::Relaxed);
-        self.active_write_holder_refresh_id.store(0, Ordering::Relaxed);
+        self.active_write_holder_refresh_id
+            .store(0, Ordering::Relaxed);
+    }
+}
+
+struct RefreshLockHolder<'a> {
+    cache_id: u64,
+    holder_id: u64,
+    acquired_at: Instant,
+    active_refresh_holder_id: &'a AtomicU64,
+    active_refresh_id: &'a AtomicU64,
+    active_refresh_waiters: &'a AtomicU64,
+}
+
+impl<'a> RefreshLockHolder<'a> {
+    fn new(cache: &'a TokenCache<impl Clone + Send + Sync>) -> Self {
+        let holder_id = NEXT_TOKEN_LOCK_HOLDER_ID.fetch_add(1, Ordering::Relaxed);
+        cache
+            .active_refresh_holder_id
+            .store(holder_id, Ordering::Relaxed);
+        info!(
+            cache_id = cache.cache_id,
+            holder_id,
+            waiting_refreshers = cache.active_refresh_waiters.load(Ordering::Relaxed),
+            active_refresh_id = cache.active_refresh_id.load(Ordering::Relaxed),
+            "token cache refresh gate acquired"
+        );
+        Self {
+            cache_id: cache.cache_id,
+            holder_id,
+            acquired_at: Instant::now(),
+            active_refresh_holder_id: &cache.active_refresh_holder_id,
+            active_refresh_id: &cache.active_refresh_id,
+            active_refresh_waiters: &cache.active_refresh_waiters,
+        }
+    }
+}
+
+impl Drop for RefreshLockHolder<'_> {
+    fn drop(&mut self) {
+        let hold_elapsed = self.acquired_at.elapsed();
+        warn!(
+            cache_id = self.cache_id,
+            holder_id = self.holder_id,
+            refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+            hold_ms = hold_elapsed.as_millis(),
+            waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
+            "token cache refresh gate released"
+        );
+        self.active_refresh_holder_id.store(0, Ordering::Relaxed);
     }
 }
 
@@ -209,6 +265,7 @@ impl<T> Default for TokenCache<T> {
         }
         Self {
             cache: Default::default(),
+            refresh: Default::default(),
             min_ttl: Duration::from_secs(300),
             // How long to wait before re-attempting a token fetch after receiving one that
             // is still within the min-ttl
@@ -216,7 +273,8 @@ impl<T> Default for TokenCache<T> {
             max_cache_age,
             cache_id: NEXT_TOKEN_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             active_refresh_id: AtomicU64::new(0),
-            active_refresh_blocked_readers: AtomicU64::new(0),
+            active_refresh_waiters: AtomicU64::new(0),
+            active_refresh_holder_id: AtomicU64::new(0),
             active_write_waiters: AtomicU64::new(0),
             active_read_holders: AtomicU64::new(0),
             active_write_holder_id: AtomicU64::new(0),
@@ -250,122 +308,112 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
 
     pub(crate) async fn get_or_insert_with<F, Fut, E>(&self, f: F) -> Result<T, E>
     where
-        F: FnOnce() -> Fut + Send,
+        F: Fn() -> Fut + Send,
         Fut: Future<Output = Result<TemporaryToken<T>, E>> + Send,
     {
-        let now = Instant::now();
-        let read_wait_start = Instant::now();
-        let read_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
-        let read_guard = self
-            .await_with_periodic_warn(self.cache.read(), |elapsed| {
+        loop {
+            let now = Instant::now();
+            let read_wait_start = Instant::now();
+            let read_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
+            let read_guard = self
+                .await_with_periodic_warn(self.cache.read(), |elapsed| {
+                    warn!(
+                        cache_id = self.cache_id,
+                        wait_id = read_wait_id,
+                        refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                        waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
+                        waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
+                        active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
+                        active_refresh_holder_id =
+                            self.active_refresh_holder_id.load(Ordering::Relaxed),
+                        active_write_holder_id =
+                            self.active_write_holder_id.load(Ordering::Relaxed),
+                        elapsed_ms = elapsed.as_millis(),
+                        "token cache read lock wait still in flight"
+                    );
+                })
+                .await;
+            let read_holder = ReadLockHolder::new(self);
+            let read_wait_elapsed = read_wait_start.elapsed();
+            if read_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
                 warn!(
                     cache_id = self.cache_id,
-                    wait_id = read_wait_id,
                     refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                    blocked_reader_count =
-                        self.active_refresh_blocked_readers.load(Ordering::Relaxed),
+                    waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
                     waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
                     active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
+                    active_refresh_holder_id =
+                        self.active_refresh_holder_id.load(Ordering::Relaxed),
                     active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                    elapsed_ms = elapsed.as_millis(),
-                    "token cache read lock wait still in flight"
+                    wait_ms = read_wait_elapsed.as_millis(),
+                    "waited for token cache read lock"
                 );
-            })
-            .await;
-        let read_holder = ReadLockHolder::new(self);
-        let read_wait_elapsed = read_wait_start.elapsed();
-        if read_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
-            let refresh_id = self.active_refresh_id.load(Ordering::Relaxed);
-            let blocked_reader_count = if refresh_id == 0 {
-                0
-            } else {
-                self.active_refresh_blocked_readers
-                    .fetch_add(1, Ordering::Relaxed)
-                    + 1
-            };
-            warn!(
-                cache_id = self.cache_id,
-                refresh_id,
-                blocked_reader_count,
-                waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-                active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                wait_ms = read_wait_elapsed.as_millis(),
-                "waited for token cache read lock"
-            );
-        }
-        if read_wait_elapsed >= TOKEN_LOCK_WAIT_WARN_THRESHOLD {
-            read_holder.log_acquired(read_wait_elapsed);
-        }
-        if let Some(cache) = read_guard.as_ref()
-            && self.is_token_valid(cache, now)
-        {
-            return Ok(cache.token.token.clone());
-        }
-        drop(read_guard);
+            }
+            if read_wait_elapsed >= TOKEN_LOCK_WAIT_WARN_THRESHOLD {
+                read_holder.log_acquired(read_wait_elapsed);
+            }
+            if let Some(cache) = read_guard.as_ref()
+                && self.is_token_valid(cache, now)
+            {
+                return Ok(cache.token.token.clone());
+            }
+            let refresh_reason = self.refresh_reason(read_guard.as_ref(), now);
+            drop(read_guard);
+            drop(read_holder);
 
-        let write_wait_start = Instant::now();
-        let write_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
-        self.active_write_waiters.fetch_add(1, Ordering::Relaxed);
-        let mut guard = self
-            .await_with_periodic_warn(self.cache.write(), |elapsed| {
+            let refresh_wait_start = Instant::now();
+            let refresh_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
+            self.active_refresh_waiters.fetch_add(1, Ordering::Relaxed);
+            let refresh_guard = self
+                .await_with_periodic_warn(self.refresh.lock(), |elapsed| {
+                    warn!(
+                        cache_id = self.cache_id,
+                        wait_id = refresh_wait_id,
+                        refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                        waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
+                        active_refresh_holder_id =
+                            self.active_refresh_holder_id.load(Ordering::Relaxed),
+                        elapsed_ms = elapsed.as_millis(),
+                        "token cache refresh wait still in flight"
+                    );
+                })
+                .await;
+            self.active_refresh_waiters.fetch_sub(1, Ordering::Relaxed);
+            let _refresh_guard = refresh_guard;
+            let _refresh_holder = RefreshLockHolder::new(self);
+            let refresh_wait_elapsed = refresh_wait_start.elapsed();
+            if refresh_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
                 warn!(
                     cache_id = self.cache_id,
-                    wait_id = write_wait_id,
                     refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                    waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-                    active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                    active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                    elapsed_ms = elapsed.as_millis(),
-                    "token cache write lock wait still in flight"
+                    waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
+                    active_refresh_holder_id =
+                        self.active_refresh_holder_id.load(Ordering::Relaxed),
+                    wait_ms = refresh_wait_elapsed.as_millis(),
+                    "waited for token cache refresh gate"
                 );
-            })
-            .await;
-        self.active_write_waiters.fetch_sub(1, Ordering::Relaxed);
-        let _write_holder = WriteLockHolder::new(self);
-        let write_wait_elapsed = write_wait_start.elapsed();
-        if write_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
-            warn!(
-                cache_id = self.cache_id,
-                waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-                active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                wait_ms = write_wait_elapsed.as_millis(),
-                "waited for token cache write lock"
-            );
-        }
-        if write_wait_elapsed >= TOKEN_IN_FLIGHT_WARN_INTERVAL {
-            info!(
-                cache_id = self.cache_id,
-                wait_id = write_wait_id,
-                refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                wait_ms = write_wait_elapsed.as_millis(),
-                "token cache write lock acquired after long wait"
-            );
-        }
+            }
+            if refresh_wait_elapsed >= TOKEN_IN_FLIGHT_WARN_INTERVAL {
+                info!(
+                    cache_id = self.cache_id,
+                    wait_id = refresh_wait_id,
+                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                    wait_ms = refresh_wait_elapsed.as_millis(),
+                    "token cache refresh gate acquired after long wait"
+                );
+            }
 
-        if let Some(cache) = guard.as_ref()
-            && self.is_token_valid(cache, now)
-        {
-            return Ok(cache.token.token.clone());
-        }
-
-        let refresh_reason = self.refresh_reason(guard.as_ref(), now);
-        let refresh_id = NEXT_REFRESH_ID.fetch_add(1, Ordering::Relaxed);
-        self.active_refresh_blocked_readers
-            .store(0, Ordering::Relaxed);
-        self.active_refresh_id.store(refresh_id, Ordering::Relaxed);
-        self.active_write_holder_refresh_id
-            .store(refresh_id, Ordering::Relaxed);
-        info!(
-            cache_id = self.cache_id,
-            write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-            refresh_id,
-            reason = refresh_reason.as_str(),
-            cached_age_ms = guard
+            let now = Instant::now();
+            let read_guard = self.cache.read().await;
+            if let Some(cache) = read_guard.as_ref()
+                && self.is_token_valid(cache, now)
+            {
+                return Ok(cache.token.token.clone());
+            }
+            let cached_age_ms = read_guard
                 .as_ref()
-                .map(|entry| entry.fetched_at.elapsed().as_millis()),
-            cached_ttl_remaining_ms = guard
+                .map(|entry| entry.fetched_at.elapsed().as_millis());
+            let cached_ttl_remaining_ms = read_guard
                 .as_ref()
                 .and_then(|entry| entry.token.expiry)
                 .map(|expiry| {
@@ -373,55 +421,122 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
                         .checked_duration_since(now)
                         .unwrap_or_default()
                         .as_millis()
-                }),
-            holding_cache_write_lock = true,
-            "starting temporary credential refresh"
-        );
-        let fetch_start = Instant::now();
-        let fetched = self
-            .await_with_periodic_warn(f(), |elapsed| {
+                });
+            drop(read_guard);
+
+            let refresh_id = NEXT_REFRESH_ID.fetch_add(1, Ordering::Relaxed);
+            self.active_refresh_id.store(refresh_id, Ordering::Relaxed);
+            info!(
+                cache_id = self.cache_id,
+                refresh_holder_id = self.active_refresh_holder_id.load(Ordering::Relaxed),
+                refresh_id,
+                reason = refresh_reason.as_str(),
+                cached_age_ms,
+                cached_ttl_remaining_ms,
+                holding_cache_write_lock = false,
+                "starting temporary credential refresh"
+            );
+            let fetch_start = Instant::now();
+            let fetched = self
+                .await_with_periodic_warn(f(), |elapsed| {
+                    warn!(
+                        cache_id = self.cache_id,
+                        refresh_id,
+                        reason = refresh_reason.as_str(),
+                        waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
+                        active_refresh_holder_id =
+                            self.active_refresh_holder_id.load(Ordering::Relaxed),
+                        active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
+                        active_write_holder_id =
+                            self.active_write_holder_id.load(Ordering::Relaxed),
+                        holding_cache_write_lock = false,
+                        elapsed_ms = elapsed.as_millis(),
+                        "temporary credential fetch still in flight"
+                    );
+                })
+                .await;
+            let fetch_elapsed = fetch_start.elapsed();
+            if fetch_elapsed > TOKEN_FETCH_WARN_THRESHOLD
+                || self.active_refresh_waiters.load(Ordering::Relaxed) > 0
+            {
                 warn!(
                     cache_id = self.cache_id,
                     refresh_id,
                     reason = refresh_reason.as_str(),
-                    blocked_reader_count =
-                        self.active_refresh_blocked_readers.load(Ordering::Relaxed),
-                    waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
+                    fetch_ms = fetch_elapsed.as_millis(),
+                    success = fetched.is_ok(),
+                    waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
+                    active_refresh_holder_id =
+                        self.active_refresh_holder_id.load(Ordering::Relaxed),
                     active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
                     active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                    holding_cache_write_lock = true,
-                    elapsed_ms = elapsed.as_millis(),
-                    "temporary credential fetch still in flight"
+                    holding_cache_write_lock = false,
+                    "temporary credential fetch finished"
                 );
-            })
-            .await;
-        let fetch_elapsed = fetch_start.elapsed();
-        let blocked_reader_count = self
-            .active_refresh_blocked_readers
-            .swap(0, Ordering::Relaxed);
-        self.active_refresh_id.store(0, Ordering::Relaxed);
-        if fetch_elapsed > TOKEN_FETCH_WARN_THRESHOLD || blocked_reader_count > 0 {
-            warn!(
-                cache_id = self.cache_id,
-                refresh_id,
-                reason = refresh_reason.as_str(),
-                fetch_ms = fetch_elapsed.as_millis(),
-                success = fetched.is_ok(),
-                blocked_reader_count,
-                waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-                active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                holding_cache_write_lock = true,
-                "temporary credential fetch finished"
-            );
+            }
+            let cached = match fetched {
+                Ok(cached) => cached,
+                Err(error) => {
+                    self.active_refresh_id.store(0, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+            let token = cached.token.clone();
+
+            let write_wait_start = Instant::now();
+            let write_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
+            self.active_write_waiters.fetch_add(1, Ordering::Relaxed);
+            let mut guard = self
+                .await_with_periodic_warn(self.cache.write(), |elapsed| {
+                    warn!(
+                        cache_id = self.cache_id,
+                        wait_id = write_wait_id,
+                        refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                        waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
+                        waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
+                        active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
+                        active_refresh_holder_id =
+                            self.active_refresh_holder_id.load(Ordering::Relaxed),
+                        active_write_holder_id =
+                            self.active_write_holder_id.load(Ordering::Relaxed),
+                        elapsed_ms = elapsed.as_millis(),
+                        "token cache write lock wait still in flight"
+                    );
+                })
+                .await;
+            self.active_write_waiters.fetch_sub(1, Ordering::Relaxed);
+            let _write_holder = WriteLockHolder::new(self);
+            let write_wait_elapsed = write_wait_start.elapsed();
+            if write_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
+                warn!(
+                    cache_id = self.cache_id,
+                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                    waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
+                    waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
+                    active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
+                    active_refresh_holder_id =
+                        self.active_refresh_holder_id.load(Ordering::Relaxed),
+                    active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
+                    wait_ms = write_wait_elapsed.as_millis(),
+                    "waited for token cache write lock"
+                );
+            }
+            if write_wait_elapsed >= TOKEN_IN_FLIGHT_WARN_INTERVAL {
+                info!(
+                    cache_id = self.cache_id,
+                    wait_id = write_wait_id,
+                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
+                    wait_ms = write_wait_elapsed.as_millis(),
+                    "token cache write lock acquired after long wait"
+                );
+            }
+            *guard = Some(CacheEntry {
+                token: cached,
+                fetched_at: Instant::now(),
+            });
+            self.active_refresh_id.store(0, Ordering::Relaxed);
+            return Ok(token);
         }
-        let cached = fetched?;
-        let token = cached.token.clone();
-        *guard = Some(CacheEntry {
-            token: cached,
-            fetched_at: Instant::now(),
-        });
-        Ok(token)
     }
 
     fn is_token_valid(&self, entry: &CacheEntry<T>, now: Instant) -> bool {
@@ -432,8 +547,8 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
             return false;
         }
         entry.token.expiry.is_none_or(|ttl| {
-            ttl.checked_duration_since(now).unwrap_or_default() > self.min_ttl ||
-            (entry.fetched_at.elapsed() < self.fetch_backoff && ttl > now)
+            ttl.checked_duration_since(now).unwrap_or_default() > self.min_ttl
+                || (entry.fetched_at.elapsed() < self.fetch_backoff && ttl > now)
         })
     }
 
@@ -482,8 +597,10 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
 #[cfg(test)]
 mod test {
     use crate::client::token::{TemporaryToken, TokenCache};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+    use tokio::sync::Barrier;
 
     // Helper function to create a token with a specific expiry duration from now
     fn create_token(expiry_duration: Option<Duration>) -> TemporaryToken<String> {
@@ -559,5 +676,36 @@ mod test {
 
         let _ = cache.get_or_insert_with(get_token).await.unwrap();
         assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_refresh_is_singleflight() {
+        let cache = Arc::new(TokenCache::default());
+        let barrier = Arc::new(Barrier::new(8));
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        COUNTER.store(0, Ordering::SeqCst);
+
+        let tasks = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    cache
+                        .get_or_insert_with(|| async {
+                            COUNTER.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            Ok::<_, String>(create_token(Some(Duration::from_secs(3600))))
+                        })
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
     }
 }
