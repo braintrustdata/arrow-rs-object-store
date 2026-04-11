@@ -27,9 +27,11 @@ use reqwest::StatusCode;
 use reqwest::header::LOCATION;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{Duration, Instant};
+
+const SLOW_HTTP_REQUEST_WARN_THRESHOLD: Duration = Duration::from_millis(250);
 
 /// Retry request error
 #[derive(Debug)]
@@ -346,12 +348,33 @@ impl RetryableRequest {
     pub(crate) async fn send(self, ctx: &mut RetryContext) -> Result<HttpResponse> {
         loop {
             let mut request = self.http.clone();
+            let method = self.http.method().clone();
+            let uri = (!self.sensitive).then(|| self.http.uri().to_string());
 
             if let Some(payload) = &self.payload {
                 *request.body_mut() = payload.clone().into();
             }
 
-            match self.client.execute(request).await {
+            let request_start = Instant::now();
+            let response = self.client.execute(request).await;
+            let request_elapsed = request_start.elapsed();
+            if request_elapsed > SLOW_HTTP_REQUEST_WARN_THRESHOLD {
+                let status = response
+                    .as_ref()
+                    .ok()
+                    .map(|response| response.status().as_u16());
+                warn!(
+                    attempt = ctx.retries + 1,
+                    method = %method,
+                    uri = uri.as_deref().unwrap_or("REDACTED"),
+                    elapsed_ms = request_elapsed.as_millis(),
+                    status,
+                    success = response.is_ok(),
+                    "slow HTTP request attempt"
+                );
+            }
+
+            match response {
                 Ok(r) => {
                     let status = r.status();
                     if status.is_success() {
