@@ -56,12 +56,15 @@ use ring::digest;
 use ring::digest::Context;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::warn;
 
 const VERSION_HEADER: &str = "x-amz-version-id";
 const SHA256_CHECKSUM: &str = "x-amz-checksum-sha256";
 const USER_DEFINED_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
 const ALGORITHM: &str = "x-amz-checksum-algorithm";
 const STORAGE_CLASS: &str = "x-amz-storage-class";
+const SLOW_S3_GET_CREDENTIAL_LOOKUP_WARN_THRESHOLD: Duration = Duration::from_millis(100);
 
 /// A specialized `Error` for object store-related errors
 #[derive(Debug, thiserror::Error)]
@@ -862,7 +865,17 @@ impl GetClient for S3Client {
         path: &Path,
         options: GetOptions,
     ) -> Result<HttpResponse> {
+        let credential_start = Instant::now();
         let credential = self.config.get_session_credential().await?;
+        let credential_elapsed = credential_start.elapsed();
+        if credential_elapsed > SLOW_S3_GET_CREDENTIAL_LOOKUP_WARN_THRESHOLD {
+            warn!(
+                head = options.head,
+                path = %path,
+                credential_ms = credential_elapsed.as_millis(),
+                "S3 GET session credential lookup was slow"
+            );
+        }
         let url = self.config.path_url(path);
         let method = match options.head {
             true => Method::HEAD,

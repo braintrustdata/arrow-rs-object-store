@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 use url::Url;
 
+const SLOW_AWS_SIGV4_SIGN_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+
 #[derive(Debug, thiserror::Error)]
 #[allow(clippy::enum_variant_names)]
 enum Error {
@@ -374,7 +376,19 @@ impl CredentialExt for HttpRequestBuilder {
             Some(authorizer) => {
                 let (client, request) = self.into_parts();
                 let mut request = request.expect("request valid");
+                let method = request.method().clone();
+                let uri = request.uri().to_string();
+                let sign_start = Instant::now();
                 authorizer.authorize(&mut request, payload_sha256);
+                let sign_elapsed = sign_start.elapsed();
+                if sign_elapsed > SLOW_AWS_SIGV4_SIGN_WARN_THRESHOLD {
+                    warn!(
+                        method = %method,
+                        uri,
+                        sign_ms = sign_elapsed.as_millis(),
+                        "AWS SigV4 signing was slow"
+                    );
+                }
 
                 Self::from_parts(client, request)
             }
