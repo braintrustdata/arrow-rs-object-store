@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
 
+const MAX_CACHE_AGE_ENV_VAR: &str = "OBJECT_STORE_TOKEN_CACHE_MAX_AGE_SECS";
+
 /// A temporary authentication token with an associated expiry
 #[derive(Debug, Clone)]
 pub(crate) struct TemporaryToken<T> {
@@ -37,6 +39,7 @@ pub(crate) struct TokenCache<T> {
     cache: RwLock<Option<CacheEntry<T>>>,
     min_ttl: Duration,
     fetch_backoff: Duration,
+    max_cache_age: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -47,12 +50,34 @@ struct CacheEntry<T> {
 
 impl<T> Default for TokenCache<T> {
     fn default() -> Self {
+        let max_cache_age = std::env::var(MAX_CACHE_AGE_ENV_VAR)
+            .ok()
+            .and_then(|value| match value.parse::<u64>() {
+                Ok(seconds) => Some(Duration::from_secs(seconds)),
+                Err(error) => {
+                    warn!(
+                        env_var = MAX_CACHE_AGE_ENV_VAR,
+                        value,
+                        %error,
+                        "failed to parse token cache max age override"
+                    );
+                    None
+                }
+            });
+        if let Some(max_cache_age) = max_cache_age {
+            warn!(
+                env_var = MAX_CACHE_AGE_ENV_VAR,
+                max_cache_age_s = max_cache_age.as_secs(),
+                "token cache max age override enabled"
+            );
+        }
         Self {
             cache: Default::default(),
             min_ttl: Duration::from_secs(300),
             // How long to wait before re-attempting a token fetch after receiving one that
             // is still within the min-ttl
             fetch_backoff: Duration::from_millis(100),
+            max_cache_age,
         }
     }
 }
@@ -64,6 +89,14 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
         Self { min_ttl, ..self }
     }
 
+    #[cfg(test)]
+    fn with_max_cache_age(self, max_cache_age: Option<Duration>) -> Self {
+        Self {
+            max_cache_age,
+            ..self
+        }
+    }
+
     pub(crate) async fn get_or_insert_with<F, Fut, E>(&self, f: F) -> Result<T, E>
     where
         F: FnOnce() -> Fut + Send,
@@ -71,6 +104,12 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
     {
         let now = Instant::now();
         let is_token_valid = |entry: &CacheEntry<T>| {
+            if self
+                .max_cache_age
+                .is_some_and(|max_cache_age| entry.fetched_at.elapsed() > max_cache_age)
+            {
+                return false;
+            }
             entry.token.expiry.is_none_or(|ttl| {
                 ttl.checked_duration_since(now).unwrap_or_default() > self.min_ttl ||
                 // if we've recently attempted to fetch this token and it's not actually
@@ -174,6 +213,7 @@ mod test {
             cache: Default::default(),
             min_ttl: Duration::from_secs(1),
             fetch_backoff: Duration::from_millis(1),
+            max_cache_age: None,
         };
 
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -194,6 +234,25 @@ mod test {
         tokio::time::sleep(Duration::from_millis(2)).await;
 
         // Should fetch, since we've passed fetch_backoff
+        let _ = cache.get_or_insert_with(get_token).await.unwrap();
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_max_cache_age_forces_refresh() {
+        let cache = TokenCache::default().with_max_cache_age(Some(Duration::from_millis(10)));
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        async fn get_token() -> Result<TemporaryToken<String>, String> {
+            COUNTER.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(create_token(Some(Duration::from_secs(3600))))
+        }
+
+        let _ = cache.get_or_insert_with(get_token).await.unwrap();
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
         let _ = cache.get_or_insert_with(get_token).await.unwrap();
         assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
     }
