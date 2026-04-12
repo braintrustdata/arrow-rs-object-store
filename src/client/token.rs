@@ -16,19 +16,10 @@
 // under the License.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
 
-const MAX_CACHE_AGE_ENV_VAR: &str = "OBJECT_STORE_TOKEN_CACHE_MAX_AGE_SECS";
-const TOKEN_LOCK_WAIT_WARN_THRESHOLD: Duration = Duration::from_millis(100);
-const TOKEN_FETCH_WARN_THRESHOLD: Duration = Duration::from_millis(100);
-const TOKEN_IN_FLIGHT_WARN_INTERVAL: Duration = Duration::from_secs(5);
-static NEXT_TOKEN_CACHE_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_TOKEN_LOCK_WAIT_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_TOKEN_LOCK_HOLDER_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_REFRESH_ID: AtomicU64 = AtomicU64::new(1);
+const STALE_WHILE_REVALIDATE_ENV_VAR: &str = "OBJECT_STORE_TOKEN_CACHE_STALE_WHILE_REVALIDATE";
 
 /// A temporary authentication token with an associated expiry
 #[derive(Debug, Clone)]
@@ -48,221 +39,17 @@ pub(crate) struct TokenCache<T> {
     refresh: Mutex<()>,
     min_ttl: Duration,
     fetch_backoff: Duration,
-    max_cache_age: Option<Duration>,
-    cache_id: u64,
-    active_refresh_id: AtomicU64,
-    active_refresh_waiters: AtomicU64,
-    active_refresh_holder_id: AtomicU64,
-    active_write_waiters: AtomicU64,
-    active_read_holders: AtomicU64,
-    active_write_holder_id: AtomicU64,
-    active_write_holder_refresh_id: AtomicU64,
+    stale_while_revalidate: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CacheEntry<T> {
     token: TemporaryToken<T>,
     fetched_at: Instant,
 }
 
-struct ReadLockHolder<'a> {
-    cache_id: u64,
-    holder_id: u64,
-    acquired_at: Instant,
-    active_read_holders: &'a AtomicU64,
-    active_write_waiters: &'a AtomicU64,
-    active_write_holder_id: &'a AtomicU64,
-}
-
-impl<'a> ReadLockHolder<'a> {
-    fn new(cache: &'a TokenCache<impl Clone + Send + Sync>) -> Self {
-        let holder_id = NEXT_TOKEN_LOCK_HOLDER_ID.fetch_add(1, Ordering::Relaxed);
-        cache.active_read_holders.fetch_add(1, Ordering::Relaxed);
-        Self {
-            cache_id: cache.cache_id,
-            holder_id,
-            acquired_at: Instant::now(),
-            active_read_holders: &cache.active_read_holders,
-            active_write_waiters: &cache.active_write_waiters,
-            active_write_holder_id: &cache.active_write_holder_id,
-        }
-    }
-
-    fn log_acquired(&self, read_wait_elapsed: Duration) {
-        info!(
-            cache_id = self.cache_id,
-            holder_id = self.holder_id,
-            wait_ms = read_wait_elapsed.as_millis(),
-            active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-            waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-            active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-            "token cache read lock acquired after long wait"
-        );
-    }
-}
-
-impl Drop for ReadLockHolder<'_> {
-    fn drop(&mut self) {
-        let remaining_read_holders = self.active_read_holders.fetch_sub(1, Ordering::Relaxed) - 1;
-        let hold_elapsed = self.acquired_at.elapsed();
-        if hold_elapsed >= TOKEN_LOCK_WAIT_WARN_THRESHOLD {
-            warn!(
-                cache_id = self.cache_id,
-                holder_id = self.holder_id,
-                hold_ms = hold_elapsed.as_millis(),
-                remaining_read_holders,
-                waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-                active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                "token cache read lock released after long hold"
-            );
-        }
-    }
-}
-
-struct WriteLockHolder<'a> {
-    cache_id: u64,
-    holder_id: u64,
-    acquired_at: Instant,
-    active_write_holder_id: &'a AtomicU64,
-    active_write_holder_refresh_id: &'a AtomicU64,
-    active_read_holders: &'a AtomicU64,
-}
-
-impl<'a> WriteLockHolder<'a> {
-    fn new(cache: &'a TokenCache<impl Clone + Send + Sync>) -> Self {
-        let holder_id = NEXT_TOKEN_LOCK_HOLDER_ID.fetch_add(1, Ordering::Relaxed);
-        cache
-            .active_write_holder_id
-            .store(holder_id, Ordering::Relaxed);
-        cache.active_write_holder_refresh_id.store(
-            cache.active_refresh_id.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        info!(
-            cache_id = cache.cache_id,
-            holder_id,
-            active_read_holders = cache.active_read_holders.load(Ordering::Relaxed),
-            waiting_writers = cache.active_write_waiters.load(Ordering::Relaxed),
-            "token cache write lock acquired"
-        );
-        Self {
-            cache_id: cache.cache_id,
-            holder_id,
-            acquired_at: Instant::now(),
-            active_write_holder_id: &cache.active_write_holder_id,
-            active_write_holder_refresh_id: &cache.active_write_holder_refresh_id,
-            active_read_holders: &cache.active_read_holders,
-        }
-    }
-}
-
-impl Drop for WriteLockHolder<'_> {
-    fn drop(&mut self) {
-        let hold_elapsed = self.acquired_at.elapsed();
-        warn!(
-            cache_id = self.cache_id,
-            holder_id = self.holder_id,
-            refresh_id = self.active_write_holder_refresh_id.load(Ordering::Relaxed),
-            hold_ms = hold_elapsed.as_millis(),
-            active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-            "token cache write lock released"
-        );
-        self.active_write_holder_id.store(0, Ordering::Relaxed);
-        self.active_write_holder_refresh_id
-            .store(0, Ordering::Relaxed);
-    }
-}
-
-struct RefreshLockHolder<'a> {
-    cache_id: u64,
-    holder_id: u64,
-    acquired_at: Instant,
-    active_refresh_holder_id: &'a AtomicU64,
-    active_refresh_id: &'a AtomicU64,
-    active_refresh_waiters: &'a AtomicU64,
-}
-
-impl<'a> RefreshLockHolder<'a> {
-    fn new(cache: &'a TokenCache<impl Clone + Send + Sync>) -> Self {
-        let holder_id = NEXT_TOKEN_LOCK_HOLDER_ID.fetch_add(1, Ordering::Relaxed);
-        cache
-            .active_refresh_holder_id
-            .store(holder_id, Ordering::Relaxed);
-        info!(
-            cache_id = cache.cache_id,
-            holder_id,
-            waiting_refreshers = cache.active_refresh_waiters.load(Ordering::Relaxed),
-            active_refresh_id = cache.active_refresh_id.load(Ordering::Relaxed),
-            "token cache refresh gate acquired"
-        );
-        Self {
-            cache_id: cache.cache_id,
-            holder_id,
-            acquired_at: Instant::now(),
-            active_refresh_holder_id: &cache.active_refresh_holder_id,
-            active_refresh_id: &cache.active_refresh_id,
-            active_refresh_waiters: &cache.active_refresh_waiters,
-        }
-    }
-}
-
-impl Drop for RefreshLockHolder<'_> {
-    fn drop(&mut self) {
-        let hold_elapsed = self.acquired_at.elapsed();
-        warn!(
-            cache_id = self.cache_id,
-            holder_id = self.holder_id,
-            refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-            hold_ms = hold_elapsed.as_millis(),
-            waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
-            "token cache refresh gate released"
-        );
-        self.active_refresh_holder_id.store(0, Ordering::Relaxed);
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum RefreshReason {
-    Empty,
-    MaxCacheAge,
-    Expired,
-    MinTtl,
-}
-
-impl RefreshReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Empty => "empty-cache",
-            Self::MaxCacheAge => "max-cache-age",
-            Self::Expired => "expired",
-            Self::MinTtl => "min-ttl",
-        }
-    }
-}
-
 impl<T> Default for TokenCache<T> {
     fn default() -> Self {
-        let max_cache_age = std::env::var(MAX_CACHE_AGE_ENV_VAR)
-            .ok()
-            .and_then(|value| match value.parse::<u64>() {
-                Ok(seconds) => Some(Duration::from_secs(seconds)),
-                Err(error) => {
-                    warn!(
-                        env_var = MAX_CACHE_AGE_ENV_VAR,
-                        value,
-                        %error,
-                        "failed to parse token cache max age override"
-                    );
-                    None
-                }
-            });
-        if let Some(max_cache_age) = max_cache_age {
-            warn!(
-                env_var = MAX_CACHE_AGE_ENV_VAR,
-                max_cache_age_s = max_cache_age.as_secs(),
-                "token cache max age override enabled"
-            );
-        }
         Self {
             cache: Default::default(),
             refresh: Default::default(),
@@ -270,15 +57,10 @@ impl<T> Default for TokenCache<T> {
             // How long to wait before re-attempting a token fetch after receiving one that
             // is still within the min-ttl
             fetch_backoff: Duration::from_millis(100),
-            max_cache_age,
-            cache_id: NEXT_TOKEN_CACHE_ID.fetch_add(1, Ordering::Relaxed),
-            active_refresh_id: AtomicU64::new(0),
-            active_refresh_waiters: AtomicU64::new(0),
-            active_refresh_holder_id: AtomicU64::new(0),
-            active_write_waiters: AtomicU64::new(0),
-            active_read_holders: AtomicU64::new(0),
-            active_write_holder_id: AtomicU64::new(0),
-            active_write_holder_refresh_id: AtomicU64::new(0),
+            stale_while_revalidate: std::env::var(STALE_WHILE_REVALIDATE_ENV_VAR)
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(true),
         }
     }
 }
@@ -291,9 +73,9 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
     }
 
     #[cfg(test)]
-    fn with_max_cache_age(self, max_cache_age: Option<Duration>) -> Self {
+    fn with_stale_while_revalidate(self, stale_while_revalidate: bool) -> Self {
         Self {
-            max_cache_age,
+            stale_while_revalidate,
             ..self
         }
     }
@@ -311,301 +93,77 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
         F: Fn() -> Fut + Send,
         Fut: Future<Output = Result<TemporaryToken<T>, E>> + Send,
     {
-        loop {
-            let now = Instant::now();
-            let read_wait_start = Instant::now();
-            let read_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
-            let read_guard = self
-                .await_with_periodic_warn(self.cache.read(), |elapsed| {
-                    warn!(
-                        cache_id = self.cache_id,
-                        wait_id = read_wait_id,
-                        refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                        waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
-                        waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-                        active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                        active_refresh_holder_id =
-                            self.active_refresh_holder_id.load(Ordering::Relaxed),
-                        active_write_holder_id =
-                            self.active_write_holder_id.load(Ordering::Relaxed),
-                        elapsed_ms = elapsed.as_millis(),
-                        "token cache read lock wait still in flight"
-                    );
-                })
-                .await;
-            let read_holder = ReadLockHolder::new(self);
-            let read_wait_elapsed = read_wait_start.elapsed();
-            if read_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
-                warn!(
-                    cache_id = self.cache_id,
-                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                    waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
-                    waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-                    active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                    active_refresh_holder_id =
-                        self.active_refresh_holder_id.load(Ordering::Relaxed),
-                    active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                    wait_ms = read_wait_elapsed.as_millis(),
-                    "waited for token cache read lock"
-                );
-            }
-            if read_wait_elapsed >= TOKEN_LOCK_WAIT_WARN_THRESHOLD {
-                read_holder.log_acquired(read_wait_elapsed);
-            }
-            if let Some(cache) = read_guard.as_ref()
-                && self.is_token_valid(cache, now)
-            {
+        let now = Instant::now();
+        let cached = self.cache.read().await.clone();
+        if let Some(cache) = cached.as_ref() {
+            if self.is_token_valid(cache, now) {
                 return Ok(cache.token.token.clone());
             }
-            let refresh_reason = self.refresh_reason(read_guard.as_ref(), now);
-            drop(read_guard);
-            drop(read_holder);
 
-            let refresh_wait_start = Instant::now();
-            let refresh_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
-            self.active_refresh_waiters.fetch_add(1, Ordering::Relaxed);
-            let refresh_guard = self
-                .await_with_periodic_warn(self.refresh.lock(), |elapsed| {
-                    warn!(
-                        cache_id = self.cache_id,
-                        wait_id = refresh_wait_id,
-                        refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                        waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
-                        active_refresh_holder_id =
-                            self.active_refresh_holder_id.load(Ordering::Relaxed),
-                        elapsed_ms = elapsed.as_millis(),
-                        "token cache refresh wait still in flight"
-                    );
-                })
-                .await;
-            self.active_refresh_waiters.fetch_sub(1, Ordering::Relaxed);
-            let _refresh_guard = refresh_guard;
-            let _refresh_holder = RefreshLockHolder::new(self);
-            let refresh_wait_elapsed = refresh_wait_start.elapsed();
-            if refresh_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
-                warn!(
-                    cache_id = self.cache_id,
-                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                    waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
-                    active_refresh_holder_id =
-                        self.active_refresh_holder_id.load(Ordering::Relaxed),
-                    wait_ms = refresh_wait_elapsed.as_millis(),
-                    "waited for token cache refresh gate"
-                );
-            }
-            if refresh_wait_elapsed >= TOKEN_IN_FLIGHT_WARN_INTERVAL {
-                info!(
-                    cache_id = self.cache_id,
-                    wait_id = refresh_wait_id,
-                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                    wait_ms = refresh_wait_elapsed.as_millis(),
-                    "token cache refresh gate acquired after long wait"
-                );
-            }
-
-            let now = Instant::now();
-            let read_guard = self.cache.read().await;
-            if let Some(cache) = read_guard.as_ref()
-                && self.is_token_valid(cache, now)
-            {
-                return Ok(cache.token.token.clone());
-            }
-            let cached_age_ms = read_guard
-                .as_ref()
-                .map(|entry| entry.fetched_at.elapsed().as_millis());
-            let cached_ttl_remaining_ms = read_guard
-                .as_ref()
-                .and_then(|entry| entry.token.expiry)
-                .map(|expiry| {
-                    expiry
-                        .checked_duration_since(now)
-                        .unwrap_or_default()
-                        .as_millis()
-                });
-            drop(read_guard);
-
-            let refresh_id = NEXT_REFRESH_ID.fetch_add(1, Ordering::Relaxed);
-            self.active_refresh_id.store(refresh_id, Ordering::Relaxed);
-            info!(
-                cache_id = self.cache_id,
-                refresh_holder_id = self.active_refresh_holder_id.load(Ordering::Relaxed),
-                refresh_id,
-                reason = refresh_reason.as_str(),
-                cached_age_ms,
-                cached_ttl_remaining_ms,
-                holding_cache_write_lock = false,
-                "starting temporary credential refresh"
-            );
-            let fetch_start = Instant::now();
-            let fetched = self
-                .await_with_periodic_warn(f(), |elapsed| {
-                    warn!(
-                        cache_id = self.cache_id,
-                        refresh_id,
-                        reason = refresh_reason.as_str(),
-                        waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
-                        active_refresh_holder_id =
-                            self.active_refresh_holder_id.load(Ordering::Relaxed),
-                        active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                        active_write_holder_id =
-                            self.active_write_holder_id.load(Ordering::Relaxed),
-                        holding_cache_write_lock = false,
-                        elapsed_ms = elapsed.as_millis(),
-                        "temporary credential fetch still in flight"
-                    );
-                })
-                .await;
-            let fetch_elapsed = fetch_start.elapsed();
-            if fetch_elapsed > TOKEN_FETCH_WARN_THRESHOLD
-                || self.active_refresh_waiters.load(Ordering::Relaxed) > 0
-            {
-                warn!(
-                    cache_id = self.cache_id,
-                    refresh_id,
-                    reason = refresh_reason.as_str(),
-                    fetch_ms = fetch_elapsed.as_millis(),
-                    success = fetched.is_ok(),
-                    waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
-                    active_refresh_holder_id =
-                        self.active_refresh_holder_id.load(Ordering::Relaxed),
-                    active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                    active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                    holding_cache_write_lock = false,
-                    "temporary credential fetch finished"
-                );
-            }
-            let cached = match fetched {
-                Ok(cached) => cached,
-                Err(error) => {
-                    self.active_refresh_id.store(0, Ordering::Relaxed);
-                    return Err(error);
+            if self.can_use_stale_while_revalidate(cache, now) {
+                if let Ok(refresh_guard) = self.refresh.try_lock() {
+                    return self.refresh_and_store(refresh_guard, &f).await;
                 }
-            };
-            let token = cached.token.clone();
 
-            let write_wait_start = Instant::now();
-            let write_wait_id = NEXT_TOKEN_LOCK_WAIT_ID.fetch_add(1, Ordering::Relaxed);
-            self.active_write_waiters.fetch_add(1, Ordering::Relaxed);
-            let mut guard = self
-                .await_with_periodic_warn(self.cache.write(), |elapsed| {
-                    warn!(
-                        cache_id = self.cache_id,
-                        wait_id = write_wait_id,
-                        refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                        waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
-                        waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-                        active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                        active_refresh_holder_id =
-                            self.active_refresh_holder_id.load(Ordering::Relaxed),
-                        active_write_holder_id =
-                            self.active_write_holder_id.load(Ordering::Relaxed),
-                        elapsed_ms = elapsed.as_millis(),
-                        "token cache write lock wait still in flight"
-                    );
-                })
-                .await;
-            self.active_write_waiters.fetch_sub(1, Ordering::Relaxed);
-            let _write_holder = WriteLockHolder::new(self);
-            let write_wait_elapsed = write_wait_start.elapsed();
-            if write_wait_elapsed > TOKEN_LOCK_WAIT_WARN_THRESHOLD {
-                warn!(
-                    cache_id = self.cache_id,
-                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                    waiting_refreshers = self.active_refresh_waiters.load(Ordering::Relaxed),
-                    waiting_writers = self.active_write_waiters.load(Ordering::Relaxed),
-                    active_read_holders = self.active_read_holders.load(Ordering::Relaxed),
-                    active_refresh_holder_id =
-                        self.active_refresh_holder_id.load(Ordering::Relaxed),
-                    active_write_holder_id = self.active_write_holder_id.load(Ordering::Relaxed),
-                    wait_ms = write_wait_elapsed.as_millis(),
-                    "waited for token cache write lock"
-                );
+                return Ok(cache.token.token.clone());
             }
-            if write_wait_elapsed >= TOKEN_IN_FLIGHT_WARN_INTERVAL {
-                info!(
-                    cache_id = self.cache_id,
-                    wait_id = write_wait_id,
-                    refresh_id = self.active_refresh_id.load(Ordering::Relaxed),
-                    wait_ms = write_wait_elapsed.as_millis(),
-                    "token cache write lock acquired after long wait"
-                );
-            }
-            *guard = Some(CacheEntry {
-                token: cached,
-                fetched_at: Instant::now(),
-            });
-            self.active_refresh_id.store(0, Ordering::Relaxed);
-            return Ok(token);
         }
+
+        let refresh_guard = self.refresh.lock().await;
+        self.refresh_and_store(refresh_guard, &f).await
+    }
+
+    async fn refresh_and_store<F, Fut, E>(
+        &self,
+        _refresh_guard: tokio::sync::MutexGuard<'_, ()>,
+        f: &F,
+    ) -> Result<T, E>
+    where
+        F: Fn() -> Fut + Send,
+        Fut: Future<Output = Result<TemporaryToken<T>, E>> + Send,
+    {
+        let now = Instant::now();
+        let cached = self.cache.read().await.clone();
+        if let Some(cache) = cached.as_ref()
+            && self.is_token_valid(cache, now)
+        {
+            return Ok(cache.token.token.clone());
+        }
+
+        let cached = f().await?;
+        let token = cached.token.clone();
+        *self.cache.write().await = Some(CacheEntry {
+            token: cached,
+            fetched_at: Instant::now(),
+        });
+
+        Ok(token)
     }
 
     fn is_token_valid(&self, entry: &CacheEntry<T>, now: Instant) -> bool {
-        if self
-            .max_cache_age
-            .is_some_and(|max_cache_age| entry.fetched_at.elapsed() > max_cache_age)
-        {
-            return false;
-        }
         entry.token.expiry.is_none_or(|ttl| {
             ttl.checked_duration_since(now).unwrap_or_default() > self.min_ttl
                 || (entry.fetched_at.elapsed() < self.fetch_backoff && ttl > now)
         })
     }
 
-    fn refresh_reason(&self, entry: Option<&CacheEntry<T>>, now: Instant) -> RefreshReason {
-        let Some(entry) = entry else {
-            return RefreshReason::Empty;
-        };
-        if self
-            .max_cache_age
-            .is_some_and(|max_cache_age| entry.fetched_at.elapsed() > max_cache_age)
-        {
-            return RefreshReason::MaxCacheAge;
-        }
-        if entry.token.expiry.is_some_and(|expiry| expiry <= now) {
-            return RefreshReason::Expired;
-        }
-        RefreshReason::MinTtl
-    }
-
-    async fn await_with_periodic_warn<F, O, L>(&self, future: F, mut log: L) -> O
-    where
-        F: Future<Output = O>,
-        L: FnMut(Duration),
-    {
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        {
-            future.await
-        }
-
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        {
-            let start = Instant::now();
-            tokio::pin!(future);
-            loop {
-                tokio::select! {
-                    output = &mut future => return output,
-                    _ = tokio::time::sleep(TOKEN_IN_FLIGHT_WARN_INTERVAL) => {
-                        log(start.elapsed());
-                    }
-                }
-            }
-        }
+    fn can_use_stale_while_revalidate(&self, entry: &CacheEntry<T>, now: Instant) -> bool {
+        self.stale_while_revalidate && entry.token.expiry.is_some_and(|ttl| ttl > now)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::client::token::{TemporaryToken, TokenCache};
+    use crate::client::token::{CacheEntry, TemporaryToken, TokenCache};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
-    use tokio::sync::Barrier;
+    use tokio::sync::Notify;
 
     // Helper function to create a token with a specific expiry duration from now
-    fn create_token(expiry_duration: Option<Duration>) -> TemporaryToken<String> {
+    fn create_token(token: &str, expiry_duration: Option<Duration>) -> TemporaryToken<String> {
         TemporaryToken {
-            token: "test_token".to_string(),
+            token: token.to_string(),
             expiry: expiry_duration.map(|d| Instant::now() + d),
         }
     }
@@ -617,7 +175,7 @@ mod test {
 
         async fn get_token() -> Result<TemporaryToken<String>, String> {
             COUNTER.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, String>(create_token(Some(Duration::from_secs(0))))
+            Ok::<_, String>(create_token("test_token", Some(Duration::from_secs(0))))
         }
 
         // Should fetch initial token
@@ -633,15 +191,19 @@ mod test {
 
     #[tokio::test]
     async fn test_min_ttl_causes_refresh() {
-        let cache = TokenCache::default()
-            .with_min_ttl(Duration::from_secs(1))
-            .with_fetch_backoff(Duration::from_millis(1));
+        let cache = TokenCache {
+            cache: Default::default(),
+            refresh: Default::default(),
+            min_ttl: Duration::from_secs(1),
+            fetch_backoff: Duration::from_millis(1),
+            stale_while_revalidate: true,
+        };
 
         static COUNTER: AtomicU32 = AtomicU32::new(0);
 
         async fn get_token() -> Result<TemporaryToken<String>, String> {
             COUNTER.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, String>(create_token(Some(Duration::from_millis(100))))
+            Ok::<_, String>(create_token("test_token", Some(Duration::from_millis(100))))
         }
 
         // Initial fetch
@@ -660,52 +222,160 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_max_cache_age_forces_refresh() {
-        let cache = TokenCache::default().with_max_cache_age(Some(Duration::from_millis(10)));
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
+    async fn test_concurrent_refresh_is_singleflight() {
+        let cache = Arc::new(TokenCache::<String>::default().with_stale_while_revalidate(false));
+        let counter = Arc::new(AtomicU32::new(0));
 
-        async fn get_token() -> Result<TemporaryToken<String>, String> {
-            COUNTER.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, String>(create_token(Some(Duration::from_secs(3600))))
-        }
+        let first = {
+            let cache = cache.clone();
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_insert_with(|| {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok::<_, String>(create_token(
+                                "fresh_token",
+                                Some(Duration::from_secs(60)),
+                            ))
+                        }
+                    })
+                    .await
+            })
+        };
 
-        let _ = cache.get_or_insert_with(get_token).await.unwrap();
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+        let second = {
+            let cache = cache.clone();
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_insert_with(|| {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, String>(create_token(
+                                "fresh_token",
+                                Some(Duration::from_secs(60)),
+                            ))
+                        }
+                    })
+                    .await
+            })
+        };
 
-        tokio::time::sleep(Duration::from_millis(15)).await;
-
-        let _ = cache.get_or_insert_with(get_token).await.unwrap();
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
+        assert_eq!(first.await.unwrap().unwrap(), "fresh_token");
+        assert_eq!(second.await.unwrap().unwrap(), "fresh_token");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn test_concurrent_refresh_is_singleflight() {
-        let cache = Arc::new(TokenCache::default());
-        let barrier = Arc::new(Barrier::new(8));
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        COUNTER.store(0, Ordering::SeqCst);
+    async fn test_stale_while_revalidate_returns_stale_token() {
+        let cache = Arc::new(
+            TokenCache::<String>::default()
+                .with_fetch_backoff(Duration::from_millis(0))
+                .with_stale_while_revalidate(true),
+        );
+        *cache.cache.write().await = Some(CacheEntry {
+            token: create_token("stale_token", Some(Duration::from_secs(60))),
+            fetched_at: Instant::now() - Duration::from_secs(301),
+        });
 
-        let tasks = (0..8)
-            .map(|_| {
-                let cache = Arc::clone(&cache);
-                let barrier = Arc::clone(&barrier);
-                tokio::spawn(async move {
-                    barrier.wait().await;
-                    cache
-                        .get_or_insert_with(|| async {
-                            COUNTER.fetch_add(1, Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(25)).await;
-                            Ok::<_, String>(create_token(Some(Duration::from_secs(3600))))
-                        })
-                        .await
-                })
+        let refresh_started = Arc::new(Notify::new());
+        let release_refresh = Arc::new(Notify::new());
+
+        let leader = {
+            let cache = cache.clone();
+            let refresh_started = refresh_started.clone();
+            let release_refresh = release_refresh.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_insert_with(|| {
+                        let refresh_started = refresh_started.clone();
+                        let release_refresh = release_refresh.clone();
+                        async move {
+                            refresh_started.notify_waiters();
+                            release_refresh.notified().await;
+                            Ok::<_, String>(create_token(
+                                "fresh_token",
+                                Some(Duration::from_secs(600)),
+                            ))
+                        }
+                    })
+                    .await
             })
-            .collect::<Vec<_>>();
+        };
 
-        for task in tasks {
-            task.await.unwrap().unwrap();
-        }
+        refresh_started.notified().await;
 
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+        let stale = cache
+            .get_or_insert_with(|| async {
+                panic!("stale follower should not fetch");
+                #[allow(unreachable_code)]
+                Ok::<_, String>(create_token("unused", Some(Duration::from_secs(60))))
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale, "stale_token");
+
+        release_refresh.notify_waiters();
+        assert_eq!(leader.await.unwrap().unwrap(), "fresh_token");
+    }
+
+    #[tokio::test]
+    async fn test_disable_stale_while_revalidate_waits_for_refresh() {
+        let cache = Arc::new(
+            TokenCache::<String>::default()
+                .with_fetch_backoff(Duration::from_millis(0))
+                .with_stale_while_revalidate(false),
+        );
+        *cache.cache.write().await = Some(CacheEntry {
+            token: create_token("stale_token", Some(Duration::from_secs(60))),
+            fetched_at: Instant::now() - Duration::from_secs(301),
+        });
+
+        let refresh_started = Arc::new(Notify::new());
+        let release_refresh = Arc::new(Notify::new());
+
+        let leader = {
+            let cache = cache.clone();
+            let refresh_started = refresh_started.clone();
+            let release_refresh = release_refresh.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_insert_with(|| {
+                        let refresh_started = refresh_started.clone();
+                        let release_refresh = release_refresh.clone();
+                        async move {
+                            refresh_started.notify_waiters();
+                            release_refresh.notified().await;
+                            Ok::<_, String>(create_token(
+                                "fresh_token",
+                                Some(Duration::from_secs(600)),
+                            ))
+                        }
+                    })
+                    .await
+            })
+        };
+
+        refresh_started.notified().await;
+
+        let follower = cache.get_or_insert_with(|| async {
+            panic!("waiting follower should not fetch");
+            #[allow(unreachable_code)]
+            Ok::<_, String>(create_token("unused", Some(Duration::from_secs(60))))
+        });
+        tokio::pin!(follower);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut follower)
+                .await
+                .is_err()
+        );
+
+        release_refresh.notify_waiters();
+        assert_eq!(follower.await.unwrap(), "fresh_token");
+        assert_eq!(leader.await.unwrap().unwrap(), "fresh_token");
     }
 }

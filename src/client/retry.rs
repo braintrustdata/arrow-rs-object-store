@@ -26,16 +26,10 @@ use http::{Method, Uri};
 use reqwest::StatusCode;
 use reqwest::header::LOCATION;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{Duration, Instant};
-
-const SLOW_HTTP_REQUEST_WARN_THRESHOLD: Duration = Duration::from_millis(250);
-const HTTP_EXECUTE_STILL_IN_FLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(5);
-static NEXT_HTTP_EXECUTE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Retry request error
 #[derive(Debug)]
@@ -352,54 +346,12 @@ impl RetryableRequest {
     pub(crate) async fn send(self, ctx: &mut RetryContext) -> Result<HttpResponse> {
         loop {
             let mut request = self.http.clone();
-            let method = self.http.method().clone();
-            let uri = (!self.sensitive).then(|| self.http.uri().to_string());
 
             if let Some(payload) = &self.payload {
                 *request.body_mut() = payload.clone().into();
             }
 
-            let request_start = Instant::now();
-            let execute_id = NEXT_HTTP_EXECUTE_ID.fetch_add(1, Ordering::Relaxed);
-            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            let execute_watchdog = {
-                let method = method.clone();
-                let uri = uri.clone().unwrap_or_else(|| "REDACTED".to_string());
-                let attempt = ctx.retries + 1;
-                tokio::spawn(async move {
-                    tokio::time::sleep(HTTP_EXECUTE_STILL_IN_FLIGHT_WARN_THRESHOLD).await;
-                    warn!(
-                        execute_id,
-                        attempt,
-                        method = %method,
-                        uri,
-                        elapsed_ms = HTTP_EXECUTE_STILL_IN_FLIGHT_WARN_THRESHOLD.as_millis(),
-                        "HTTP request execute still in flight"
-                    );
-                })
-            };
-            let response = self.client.execute(request).await;
-            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            execute_watchdog.abort();
-            let request_elapsed = request_start.elapsed();
-            if request_elapsed > SLOW_HTTP_REQUEST_WARN_THRESHOLD {
-                let status = response
-                    .as_ref()
-                    .ok()
-                    .map(|response| response.status().as_u16());
-                warn!(
-                    execute_id,
-                    attempt = ctx.retries + 1,
-                    method = %method,
-                    uri = uri.as_deref().unwrap_or("REDACTED"),
-                    elapsed_ms = request_elapsed.as_millis(),
-                    status,
-                    success = response.is_ok(),
-                    "slow HTTP request attempt"
-                );
-            }
-
-            match response {
+            match self.client.execute(request).await {
                 Ok(r) => {
                     let status = r.status();
                     if status.is_success() {

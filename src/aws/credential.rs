@@ -35,9 +35,6 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 use url::Url;
 
-const SLOW_AWS_SIGV4_SIGN_WARN_THRESHOLD: Duration = Duration::from_millis(100);
-const AWS_CREDENTIAL_IN_FLIGHT_WARN_INTERVAL: Duration = Duration::from_secs(5);
-
 #[derive(Debug, thiserror::Error)]
 #[allow(clippy::enum_variant_names)]
 enum Error {
@@ -377,19 +374,7 @@ impl CredentialExt for HttpRequestBuilder {
             Some(authorizer) => {
                 let (client, request) = self.into_parts();
                 let mut request = request.expect("request valid");
-                let method = request.method().clone();
-                let uri = request.uri().to_string();
-                let sign_start = Instant::now();
                 authorizer.authorize(&mut request, payload_sha256);
-                let sign_elapsed = sign_start.elapsed();
-                if sign_elapsed > SLOW_AWS_SIGV4_SIGN_WARN_THRESHOLD {
-                    warn!(
-                        method = %method,
-                        uri,
-                        sign_ms = sign_elapsed.as_millis(),
-                        "AWS SigV4 signing was slow"
-                    );
-                }
 
                 Self::from_parts(client, request)
             }
@@ -576,96 +561,61 @@ async fn instance_creds(
     endpoint: &str,
     imdsv1_fallback: bool,
 ) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
-    let start = Instant::now();
-    let fetch = async {
-        const CREDENTIALS_PATH: &str = "latest/meta-data/iam/security-credentials";
-        const AWS_EC2_METADATA_TOKEN_HEADER: &str = "X-aws-ec2-metadata-token";
+    const CREDENTIALS_PATH: &str = "latest/meta-data/iam/security-credentials";
+    const AWS_EC2_METADATA_TOKEN_HEADER: &str = "X-aws-ec2-metadata-token";
 
-        let token_url = format!("{endpoint}/latest/api/token");
+    let token_url = format!("{endpoint}/latest/api/token");
 
-        let token_result = client
-            .request(Method::PUT, token_url)
-            .header("X-aws-ec2-metadata-token-ttl-seconds", "600") // 10 minute TTL
-            .retryable(retry_config)
-            .idempotent(true)
-            .send()
-            .await;
+    let token_result = client
+        .request(Method::PUT, token_url)
+        .header("X-aws-ec2-metadata-token-ttl-seconds", "600") // 10 minute TTL
+        .retryable(retry_config)
+        .idempotent(true)
+        .send()
+        .await;
 
-        let token = match token_result {
-            Ok(t) => Some(t.into_body().text().await?),
-            Err(e) if imdsv1_fallback && matches!(e.status(), Some(StatusCode::FORBIDDEN)) => {
-                warn!("received 403 from metadata endpoint, falling back to IMDSv1");
-                None
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        let role_url = format!("{endpoint}/{CREDENTIALS_PATH}/");
-        let mut role_request = client.request(Method::GET, role_url);
-
-        if let Some(token) = &token {
-            role_request = role_request.header(AWS_EC2_METADATA_TOKEN_HEADER, token);
+    let token = match token_result {
+        Ok(t) => Some(t.into_body().text().await?),
+        Err(e) if imdsv1_fallback && matches!(e.status(), Some(StatusCode::FORBIDDEN)) => {
+            warn!("received 403 from metadata endpoint, falling back to IMDSv1");
+            None
         }
-
-        let role = role_request
-            .send_retry(retry_config)
-            .await?
-            .into_body()
-            .text()
-            .await?;
-
-        let creds_url = format!("{endpoint}/{CREDENTIALS_PATH}/{role}");
-        let mut creds_request = client.request(Method::GET, creds_url);
-        if let Some(token) = &token {
-            creds_request = creds_request.header(AWS_EC2_METADATA_TOKEN_HEADER, token);
-        }
-
-        let creds: InstanceCredentials = creds_request
-            .send_retry(retry_config)
-            .await?
-            .into_body()
-            .json()
-            .await?;
-
-        let now = Utc::now();
-        let ttl = (creds.expiration - now).to_std().unwrap_or_default();
-        let elapsed = start.elapsed();
-        if elapsed > Duration::from_millis(100) {
-            warn!(
-                endpoint,
-                fetch_ms = elapsed.as_millis(),
-                ttl_s = ttl.as_secs(),
-                "instance metadata credential refresh was slow ({:?})",
-                elapsed
-            );
-        }
-        Ok(TemporaryToken {
-            token: Arc::new(creds.into()),
-            expiry: Some(Instant::now() + ttl),
-        })
+        Err(e) => return Err(e.into()),
     };
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    {
-        fetch.await
+    let role_url = format!("{endpoint}/{CREDENTIALS_PATH}/");
+    let mut role_request = client.request(Method::GET, role_url);
+
+    if let Some(token) = &token {
+        role_request = role_request.header(AWS_EC2_METADATA_TOKEN_HEADER, token);
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    {
-        tokio::pin!(fetch);
-        loop {
-            tokio::select! {
-                result = &mut fetch => return result,
-                _ = tokio::time::sleep(AWS_CREDENTIAL_IN_FLIGHT_WARN_INTERVAL) => {
-                    warn!(
-                        endpoint,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "instance metadata credential refresh still in flight"
-                    );
-                }
-            }
-        }
+    let role = role_request
+        .send_retry(retry_config)
+        .await?
+        .into_body()
+        .text()
+        .await?;
+
+    let creds_url = format!("{endpoint}/{CREDENTIALS_PATH}/{role}");
+    let mut creds_request = client.request(Method::GET, creds_url);
+    if let Some(token) = &token {
+        creds_request = creds_request.header(AWS_EC2_METADATA_TOKEN_HEADER, token);
     }
+
+    let creds: InstanceCredentials = creds_request
+        .send_retry(retry_config)
+        .await?
+        .into_body()
+        .json()
+        .await?;
+
+    let now = Utc::now();
+    let ttl = (creds.expiration - now).to_std().unwrap_or_default();
+    Ok(TemporaryToken {
+        token: Arc::new(creds.into()),
+        expiry: Some(Instant::now() + ttl),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -708,7 +658,6 @@ async fn web_identity(
     session_name: &str,
     endpoint: &str,
 ) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
-    let start = Instant::now();
     let token = std::fs::read_to_string(token_path)
         .map_err(|e| format!("Failed to read token file '{token_path}': {e}"))?;
 
@@ -737,18 +686,6 @@ async fn web_identity(
     let creds = resp.assume_role_with_web_identity_result.credentials;
     let now = Utc::now();
     let ttl = (creds.expiration - now).to_std().unwrap_or_default();
-    let elapsed = start.elapsed();
-    if elapsed > Duration::from_millis(100) {
-        warn!(
-            endpoint,
-            role_arn,
-            session_name,
-            fetch_ms = elapsed.as_millis(),
-            ttl_s = ttl.as_secs(),
-            "web identity credential refresh was slow ({:?})",
-            elapsed
-        );
-    }
 
     Ok(TemporaryToken {
         token: Arc::new(creds.into()),
@@ -788,7 +725,6 @@ async fn task_credential(
     retry: &RetryConfig,
     url: &str,
 ) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
-    let start = Instant::now();
     let creds: InstanceCredentials = client
         .get(url)
         .send_retry(retry)
@@ -799,15 +735,6 @@ async fn task_credential(
 
     let now = Utc::now();
     let ttl = (creds.expiration - now).to_std().unwrap_or_default();
-    let elapsed = start.elapsed();
-    if elapsed > Duration::from_millis(100) {
-        warn!(
-            url,
-            fetch_ms = elapsed.as_millis(),
-            ttl_s = ttl.as_secs(),
-            "task credential refresh was slow"
-        );
-    }
     Ok(TemporaryToken {
         token: Arc::new(creds.into()),
         expiry: Some(Instant::now() + ttl),
@@ -854,7 +781,6 @@ async fn eks_credential(
     url: &str,
     token_file: &str,
 ) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
-    let start = Instant::now();
     // Spawn IO to blocking tokio pool if running in tokio context
     let token = match tokio::runtime::Handle::try_current() {
         Ok(runtime) => {
@@ -875,17 +801,6 @@ async fn eks_credential(
 
     let now = Utc::now();
     let ttl = (creds.expiration - now).to_std().unwrap_or_default();
-    let elapsed = start.elapsed();
-    if elapsed > Duration::from_millis(100) {
-        warn!(
-            url,
-            token_file,
-            fetch_ms = elapsed.as_millis(),
-            ttl_s = ttl.as_secs(),
-            "eks pod credential refresh was slow ({:?})",
-            elapsed
-        );
-    }
 
     Ok(TemporaryToken {
         token: Arc::new(creds.into()),
