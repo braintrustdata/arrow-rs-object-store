@@ -33,6 +33,10 @@ use tracing::{Instrument, info_span, warn};
 const SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS: u128 = 500;
 const SLOW_FOOTER_CONNECT_LOG_THRESHOLD_MS: u128 = 500;
 
+fn is_footer_path(path: &str) -> bool {
+    path.ends_with(".footer") || path.contains("%2Efooter") || path.contains("%2efooter")
+}
+
 /// An HTTP protocol error
 ///
 /// Clients should return this when an HTTP request fails to be completed, e.g. because
@@ -224,6 +228,7 @@ impl HttpService for reqwest::Client {
         let uri = parts.uri.clone();
         let host = uri.host().unwrap_or("").to_string();
         let path = uri.path().to_string();
+        let is_footer = is_footer_path(&path);
         let request_body_bytes = body.content_length();
 
         let url = parts.uri.to_string().parse().unwrap();
@@ -231,53 +236,63 @@ impl HttpService for reqwest::Client {
         *req.headers_mut() = parts.headers;
         *req.body_mut() = Some(body.into_reqwest());
 
-        let span = info_span!(
-            "object_store http execute",
-            method = %method,
-            host = %host,
-            path = %path,
-            request_body_bytes,
-            elapsed_ms = tracing::field::Empty,
-            status = tracing::field::Empty,
-            version = tracing::field::Empty,
-            remote_addr = tracing::field::Empty,
-            error = tracing::field::Empty,
-        );
         let start = Instant::now();
-        let r = match self.execute(req).instrument(span.clone()).await {
-            Ok(response) => response,
-            Err(error) => {
-                let elapsed = start.elapsed();
-                let error = HttpError::reqwest(error);
-                let error_string = error.to_string();
-                span.record("elapsed_ms", elapsed.as_millis() as u64);
-                span.record("error", error_string.as_str());
-                if elapsed.as_millis() >= SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS {
-                    warn!(
-                        method = %method,
-                        host = %host,
-                        path = %path,
-                        elapsed_ms = elapsed.as_millis(),
-                        request_body_bytes,
-                        error = %error_string,
-                        "Slow object_store HTTP execute"
-                    );
+        let r = if is_footer {
+            let span = info_span!(
+                "object_store footer low-level HTTP execute",
+                method = %method,
+                host = %host,
+                path = %path,
+                request_body_bytes,
+                elapsed_ms = tracing::field::Empty,
+                status = tracing::field::Empty,
+                version = tracing::field::Empty,
+                remote_addr = tracing::field::Empty,
+                error = tracing::field::Empty,
+            );
+            match self.execute(req).instrument(span.clone()).await {
+                Ok(response) => {
+                    let elapsed = start.elapsed();
+                    let status = response.status();
+                    let version = response.version();
+                    let remote_addr = response.remote_addr();
+                    span.record("elapsed_ms", elapsed.as_millis() as u64);
+                    span.record("status", status.as_u16());
+                    span.record("version", format!("{version:?}"));
+                    if let Some(remote_addr) = remote_addr {
+                        span.record("remote_addr", remote_addr.to_string());
+                    }
+                    response
                 }
-                return Err(error);
+                Err(error) => {
+                    let elapsed = start.elapsed();
+                    let error = HttpError::reqwest(error);
+                    let error_string = error.to_string();
+                    span.record("elapsed_ms", elapsed.as_millis() as u64);
+                    span.record("error", error_string.as_str());
+                    if elapsed.as_millis() >= SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS {
+                        warn!(
+                            method = %method,
+                            host = %host,
+                            path = %path,
+                            elapsed_ms = elapsed.as_millis(),
+                            request_body_bytes,
+                            error = %error_string,
+                            "Slow object_store footer low-level HTTP execute"
+                        );
+                    }
+                    return Err(error);
+                }
             }
+        } else {
+            self.execute(req).await.map_err(HttpError::reqwest)?
         };
         let elapsed = start.elapsed();
         let status = r.status();
         let version = r.version();
         let remote_addr = r.remote_addr();
         let response_body_bytes = r.content_length();
-        span.record("elapsed_ms", elapsed.as_millis() as u64);
-        span.record("status", status.as_u16());
-        span.record("version", format!("{version:?}"));
-        if let Some(remote_addr) = remote_addr {
-            span.record("remote_addr", remote_addr.to_string());
-        }
-        if elapsed.as_millis() >= SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS {
+        if is_footer && elapsed.as_millis() >= SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS {
             warn!(
                 method = %method,
                 host = %host,
@@ -288,7 +303,7 @@ impl HttpService for reqwest::Client {
                 elapsed_ms = elapsed.as_millis(),
                 request_body_bytes,
                 response_body_bytes,
-                "Slow object_store HTTP execute"
+                "Slow object_store footer low-level HTTP execute"
             );
         }
 
