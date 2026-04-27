@@ -25,9 +25,32 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
+use tracing::warn;
+
+const SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS: u128 = 500;
+
+#[derive(Clone, Debug)]
+struct FooterSpawnFields {
+    method: String,
+    host: String,
+    path: String,
+}
+
+fn footer_spawn_fields(req: &HttpRequest) -> Option<FooterSpawnFields> {
+    let path = req.uri().path();
+    let is_footer =
+        path.ends_with(".footer") || path.contains("%2Efooter") || path.contains("%2efooter");
+
+    is_footer.then(|| FooterSpawnFields {
+        method: req.method().to_string(),
+        host: req.uri().host().unwrap_or("").to_string(),
+        path: path.to_string(),
+    })
+}
 
 /// Spawn error
 #[derive(Debug, Error)]
@@ -62,16 +85,60 @@ impl<T: HttpService + Clone> SpawnService<T> {
 impl<T: HttpService + Clone> HttpService for SpawnService<T> {
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         let inner = self.inner.clone();
+        let footer_fields = footer_spawn_fields(&req);
+        let call_start = Instant::now();
         let (send, recv) = tokio::sync::oneshot::channel();
 
         // We use an unbounded channel to prevent backpressure across the runtime boundary
         // which could in turn starve the underlying IO operations
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 
+        let worker_footer_fields = footer_fields.clone();
         let handle = SpawnHandle(self.runtime.spawn(async move {
+            if let Some(fields) = &worker_footer_fields {
+                let elapsed = call_start.elapsed();
+                if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
+                    warn!(
+                        method = %fields.method,
+                        host = %fields.host,
+                        path = %fields.path,
+                        elapsed_ms = elapsed.as_millis(),
+                        "Slow object_store footer spawn handoff"
+                    );
+                }
+            }
+
+            let inner_start = Instant::now();
             let r = match HttpService::call(&inner, req).await {
-                Ok(resp) => resp,
+                Ok(resp) => {
+                    if let Some(fields) = &worker_footer_fields {
+                        let elapsed = inner_start.elapsed();
+                        if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
+                            warn!(
+                                method = %fields.method,
+                                host = %fields.host,
+                                path = %fields.path,
+                                elapsed_ms = elapsed.as_millis(),
+                                "Slow object_store footer spawned inner HTTP call"
+                            );
+                        }
+                    }
+                    resp
+                }
                 Err(e) => {
+                    if let Some(fields) = &worker_footer_fields {
+                        let elapsed = inner_start.elapsed();
+                        if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
+                            warn!(
+                                method = %fields.method,
+                                host = %fields.host,
+                                path = %fields.path,
+                                elapsed_ms = elapsed.as_millis(),
+                                error = %e,
+                                "Slow object_store footer spawned inner HTTP call"
+                            );
+                        }
+                    }
                     let _ = send.send(Err(e));
                     return;
                 }
@@ -82,20 +149,78 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
                 return;
             }
 
+            let body_start = Instant::now();
+            let mut frame_index = 0u64;
+            let mut bytes_sent = 0usize;
             while let Some(x) = body.frame().await {
+                if let Some(fields) = &worker_footer_fields {
+                    let elapsed = body_start.elapsed();
+                    let frame_bytes = x
+                        .as_ref()
+                        .ok()
+                        .and_then(|frame| frame.data_ref())
+                        .map(|data| data.len());
+                    if let Some(frame_bytes) = frame_bytes {
+                        bytes_sent += frame_bytes;
+                    }
+                    if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
+                        warn!(
+                            method = %fields.method,
+                            host = %fields.host,
+                            path = %fields.path,
+                            elapsed_ms = elapsed.as_millis(),
+                            frame_index,
+                            frame_bytes,
+                            bytes_sent,
+                            error = x.as_ref().err().map(|error| error.to_string()).as_deref(),
+                            "Slow object_store footer spawned body frame"
+                        );
+                    }
+                }
                 if sender.send(x).is_err() {
                     return;
+                }
+                frame_index += 1;
+            }
+
+            if let Some(fields) = &worker_footer_fields {
+                let elapsed = body_start.elapsed();
+                if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
+                    warn!(
+                        method = %fields.method,
+                        host = %fields.host,
+                        path = %fields.path,
+                        elapsed_ms = elapsed.as_millis(),
+                        frame_count = frame_index,
+                        bytes_sent,
+                        "Slow object_store footer spawned body stream"
+                    );
                 }
             }
         }));
 
         let parts = recv.await.map_err(|_| SpawnError {})??;
+        if let Some(fields) = &footer_fields {
+            let elapsed = call_start.elapsed();
+            if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
+                warn!(
+                    method = %fields.method,
+                    host = %fields.host,
+                    path = %fields.path,
+                    elapsed_ms = elapsed.as_millis(),
+                    "Slow object_store footer spawned response parts"
+                );
+            }
+        }
 
         Ok(Response::from_parts(
             parts,
             HttpResponseBody::new(SpawnBody {
                 stream: receiver,
                 _worker: handle,
+                footer_fields,
+                pending_since: None,
+                frame_index: 0,
             }),
         ))
     }
@@ -114,6 +239,9 @@ type StreamItem = Result<Frame<Bytes>, HttpError>;
 struct SpawnBody {
     stream: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
     _worker: SpawnHandle,
+    footer_fields: Option<FooterSpawnFields>,
+    pending_since: Option<Instant>,
+    frame_index: u64,
 }
 
 impl Body for SpawnBody {
@@ -121,7 +249,33 @@ impl Body for SpawnBody {
     type Error = HttpError;
 
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<StreamItem>> {
-        self.stream.poll_recv(cx)
+        match self.stream.poll_recv(cx) {
+            Poll::Pending => {
+                if self.footer_fields.is_some() && self.pending_since.is_none() {
+                    self.pending_since = Some(Instant::now());
+                }
+                Poll::Pending
+            }
+            Poll::Ready(item) => {
+                let footer_fields = self.footer_fields.clone();
+                let pending_since = self.pending_since.take();
+                if let (Some(fields), Some(pending_since)) = (footer_fields, pending_since) {
+                    let elapsed = pending_since.elapsed();
+                    if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
+                        warn!(
+                            method = %fields.method,
+                            host = %fields.host,
+                            path = %fields.path,
+                            elapsed_ms = elapsed.as_millis(),
+                            frame_index = self.frame_index,
+                            "Slow object_store footer spawned body recv"
+                        );
+                    }
+                }
+                self.frame_index += 1;
+                Poll::Ready(item)
+            }
+        }
     }
 }
 
