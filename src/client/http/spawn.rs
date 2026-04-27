@@ -145,7 +145,8 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
             };
 
             let (parts, mut body) = r.into_parts();
-            if send.send(Ok(parts)).is_err() {
+            let response_parts_ready_at = Instant::now();
+            if send.send(Ok((parts, response_parts_ready_at))).is_err() {
                 return;
             }
 
@@ -199,15 +200,19 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
             }
         }));
 
-        let parts = recv.await.map_err(|_| SpawnError {})??;
+        let (parts, response_parts_ready_at) = recv.await.map_err(|_| SpawnError {})??;
         if let Some(fields) = &footer_fields {
             let elapsed = call_start.elapsed();
             if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
+                let worker_elapsed = response_parts_ready_at.duration_since(call_start);
+                let response_parts_recv_lag = response_parts_ready_at.elapsed();
                 warn!(
                     method = %fields.method,
                     host = %fields.host,
                     path = %fields.path,
                     elapsed_ms = elapsed.as_millis(),
+                    worker_elapsed_ms = worker_elapsed.as_millis(),
+                    response_parts_recv_lag_ms = response_parts_recv_lag.as_millis(),
                     "Slow object_store footer spawned response parts"
                 );
             }
