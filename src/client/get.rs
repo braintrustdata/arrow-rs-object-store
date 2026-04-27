@@ -295,7 +295,6 @@ impl<T: GetClient> GetContext<T> {
                         (Err(e), _) => return Err(Self::err(e)),
                     }
                 }
-                Ok(None)
             },
         )
             .boxed()

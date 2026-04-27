@@ -37,32 +37,32 @@ impl Resolve for ShuffleResolver {
         let span = info_span!("object_store dns resolve", host = %host_for_span);
         Box::pin(
             async move {
-            let start = Instant::now();
-            // use `JoinSet` to propagate cancelation to tasks that haven't started running yet.
-            let mut tasks = JoinSet::new();
-            tasks.spawn_blocking(move || {
-                let it = (name.as_str(), 0).to_socket_addrs()?;
-                let mut addrs = it.collect::<Vec<_>>();
+                let start = Instant::now();
+                // use `JoinSet` to propagate cancelation to tasks that haven't started running yet.
+                let mut tasks = JoinSet::new();
+                tasks.spawn_blocking(move || -> std::io::Result<Addrs> {
+                    let it = (name.as_str(), 0).to_socket_addrs()?;
+                    let mut addrs = it.collect::<Vec<_>>();
 
-                addrs.shuffle(&mut rand::rng());
+                    addrs.shuffle(&mut rand::rng());
 
-                Ok(Box::new(addrs.into_iter()) as Addrs)
-            });
+                    Ok(Box::new(addrs.into_iter()) as Addrs)
+                });
 
-            let result = match tasks.join_next().await.expect("spawned on task") {
-                Ok(Ok(addrs)) => Ok(addrs),
-                Ok(Err(err)) => Err(Box::new(err) as DynErr),
-                Err(err) => Err(Box::new(err) as DynErr),
-            };
-            let elapsed = start.elapsed();
-            if elapsed.as_millis() >= SLOW_DNS_RESOLVE_LOG_THRESHOLD_MS {
-                warn!(
-                    host = %host,
-                    elapsed_ms = elapsed.as_millis(),
-                    error = result.as_ref().err().map(|x| x.to_string()),
-                    "Slow object_store DNS resolve"
-                );
-            }
+                let result = match tasks.join_next().await.expect("spawned on task") {
+                    Ok(Ok(addrs)) => Ok(addrs),
+                    Ok(Err(err)) => Err(Box::new(err) as DynErr),
+                    Err(err) => Err(Box::new(err) as DynErr),
+                };
+                let elapsed = start.elapsed();
+                if elapsed.as_millis() >= SLOW_DNS_RESOLVE_LOG_THRESHOLD_MS {
+                    warn!(
+                        host = %host,
+                        elapsed_ms = elapsed.as_millis(),
+                        error = result.as_ref().err().map(|x| x.to_string()),
+                        "Slow object_store DNS resolve"
+                    );
+                }
                 result
             }
             .instrument(span),
