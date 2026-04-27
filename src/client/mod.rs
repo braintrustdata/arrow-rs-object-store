@@ -746,6 +746,7 @@ impl ClientOptions {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn client(&self) -> Result<reqwest::Client> {
         let mut builder = reqwest::ClientBuilder::new();
+        builder = builder.connector_layer(http::FooterConnectTraceLayer);
 
         if std::env::var_os("OBJECT_STORE_HTTP_CONNECTION_VERBOSE").is_some() {
             builder = builder.connection_verbose(true);

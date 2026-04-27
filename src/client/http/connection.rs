@@ -22,12 +22,16 @@ use async_trait::async_trait;
 use http::{Method, Uri};
 use http_body_util::BodyExt;
 use std::error::Error;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::runtime::Handle;
 use tracing::{Instrument, info_span, warn};
 
 const SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS: u128 = 500;
+const SLOW_FOOTER_CONNECT_LOG_THRESHOLD_MS: u128 = 500;
 
 /// An HTTP protocol error
 ///
@@ -227,27 +231,60 @@ impl HttpService for reqwest::Client {
         *req.headers_mut() = parts.headers;
         *req.body_mut() = Some(body.into_reqwest());
 
+        let span = info_span!(
+            "object_store http execute",
+            method = %method,
+            host = %host,
+            path = %path,
+            request_body_bytes,
+            elapsed_ms = tracing::field::Empty,
+            status = tracing::field::Empty,
+            version = tracing::field::Empty,
+            remote_addr = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
         let start = Instant::now();
-        let r = self
-            .execute(req)
-            .instrument(info_span!(
-                "object_store http execute",
-                method = %method,
-                host = %host,
-                path = %path,
-                request_body_bytes
-            ))
-            .await
-            .map_err(HttpError::reqwest)?;
+        let r = match self.execute(req).instrument(span.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                let elapsed = start.elapsed();
+                let error = HttpError::reqwest(error);
+                let error_string = error.to_string();
+                span.record("elapsed_ms", elapsed.as_millis() as u64);
+                span.record("error", error_string.as_str());
+                if elapsed.as_millis() >= SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS {
+                    warn!(
+                        method = %method,
+                        host = %host,
+                        path = %path,
+                        elapsed_ms = elapsed.as_millis(),
+                        request_body_bytes,
+                        error = %error_string,
+                        "Slow object_store HTTP execute"
+                    );
+                }
+                return Err(error);
+            }
+        };
         let elapsed = start.elapsed();
         let status = r.status();
+        let version = r.version();
+        let remote_addr = r.remote_addr();
         let response_body_bytes = r.content_length();
+        span.record("elapsed_ms", elapsed.as_millis() as u64);
+        span.record("status", status.as_u16());
+        span.record("version", format!("{version:?}"));
+        if let Some(remote_addr) = remote_addr {
+            span.record("remote_addr", remote_addr.to_string());
+        }
         if elapsed.as_millis() >= SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS {
             warn!(
                 method = %method,
                 host = %host,
                 path = %path,
                 status = status.as_u16(),
+                version = ?version,
+                remote_addr = remote_addr.map(|addr| addr.to_string()),
                 elapsed_ms = elapsed.as_millis(),
                 request_body_bytes,
                 response_body_bytes,
@@ -322,6 +359,76 @@ impl HttpService for reqwest::Client {
 pub trait HttpConnector: std::fmt::Debug + Send + Sync + 'static {
     /// Create a new [`HttpClient`] with the provided [`ClientOptions`]
     fn connect(&self, options: &ClientOptions) -> crate::Result<HttpClient>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FooterConnectTraceLayer;
+
+#[derive(Debug, Clone)]
+pub(crate) struct FooterConnectTraceService<S> {
+    inner: S,
+}
+
+impl<S> tower_layer::Layer<S> for FooterConnectTraceLayer {
+    type Service = FooterConnectTraceService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        FooterConnectTraceService { inner }
+    }
+}
+
+impl<S, Request> tower_service::Service<Request> for FooterConnectTraceService<S>
+where
+    S: tower_service::Service<Request> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
+    Request: std::fmt::Debug + Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let request_debug = format!("{request:?}");
+        let is_footer =
+            request_debug.contains(".footer") || request_debug.to_lowercase().contains("%2efooter");
+        let connect = self.inner.call(request);
+
+        Box::pin(async move {
+            if !is_footer {
+                return connect.await;
+            }
+
+            let span = info_span!(
+                "object_store footer connector connect",
+                request = %request_debug,
+                elapsed_ms = tracing::field::Empty,
+                error = tracing::field::Empty,
+            );
+            let start = Instant::now();
+            let result = async { connect.await }.instrument(span.clone()).await;
+            let elapsed = start.elapsed();
+            let error = result.as_ref().err().map(|error| error.to_string());
+            span.record("elapsed_ms", elapsed.as_millis() as u64);
+            if let Some(error) = &error {
+                span.record("error", error);
+            }
+            if elapsed.as_millis() >= SLOW_FOOTER_CONNECT_LOG_THRESHOLD_MS {
+                warn!(
+                    request = %request_debug,
+                    elapsed_ms = elapsed.as_millis(),
+                    error = error.as_deref(),
+                    "Slow object_store footer connector connect"
+                );
+            }
+            result
+        })
+    }
 }
 
 /// [`HttpConnector`] using [`reqwest::Client`]
