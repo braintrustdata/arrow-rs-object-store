@@ -40,7 +40,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{Instrument, info, info_span, warn};
 use url::Url;
 
 pub(crate) const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -52,6 +52,7 @@ const DEFAULT_GCS_SIGN_BLOB_HOST: &str = "storage.googleapis.com";
 
 const DEFAULT_METADATA_HOST: &str = "metadata.google.internal";
 const DEFAULT_METADATA_IP: &str = "169.254.169.254";
+const SLOW_GCP_CREDENTIAL_LOG_THRESHOLD_MS: u128 = 500;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -406,18 +407,34 @@ async fn make_metadata_request(
 ) -> crate::Result<TokenResponse> {
     let url =
         format!("http://{hostname}/computeMetadata/v1/instance/service-accounts/default/token");
-    let response: TokenResponse = client
-        .get(url)
-        .header("Metadata-Flavor", "Google")
-        .query(&[("audience", "https://www.googleapis.com/oauth2/v4/token")])
-        .send_retry(retry)
-        .await
-        .map_err(|source| Error::TokenRequest { source })?
-        .into_body()
-        .json()
-        .await
-        .map_err(|source| Error::TokenResponseBody { source })?;
-    Ok(response)
+    let start = Instant::now();
+    let response = async {
+        client
+            .get(url)
+            .header("Metadata-Flavor", "Google")
+            .query(&[("audience", "https://www.googleapis.com/oauth2/v4/token")])
+            .send_retry(retry)
+            .await
+            .map_err(|source| Error::TokenRequest { source })?
+            .into_body()
+            .json()
+            .await
+            .map_err(|source| Error::TokenResponseBody { source })
+    }
+    .instrument(info_span!("gcp metadata token request", hostname))
+    .await;
+
+    let elapsed = start.elapsed();
+    if elapsed.as_millis() >= SLOW_GCP_CREDENTIAL_LOG_THRESHOLD_MS {
+        warn!(
+            hostname,
+            elapsed_ms = elapsed.as_millis(),
+            error = response.as_ref().err().map(|x| x.to_string()),
+            "Slow GCP metadata token request"
+        );
+    }
+
+    Ok(response?)
 }
 
 #[async_trait]
@@ -471,17 +488,33 @@ async fn make_metadata_request_for_email(
 ) -> crate::Result<String> {
     let url =
         format!("http://{hostname}/computeMetadata/v1/instance/service-accounts/default/email",);
-    let response = client
-        .get(url)
-        .header("Metadata-Flavor", "Google")
-        .send_retry(retry)
-        .await
-        .map_err(|source| Error::TokenRequest { source })?
-        .into_body()
-        .text()
-        .await
-        .map_err(|source| Error::TokenResponseBody { source })?;
-    Ok(response)
+    let start = Instant::now();
+    let response = async {
+        client
+            .get(url)
+            .header("Metadata-Flavor", "Google")
+            .send_retry(retry)
+            .await
+            .map_err(|source| Error::TokenRequest { source })?
+            .into_body()
+            .text()
+            .await
+            .map_err(|source| Error::TokenResponseBody { source })
+    }
+    .instrument(info_span!("gcp metadata email request", hostname))
+    .await;
+
+    let elapsed = start.elapsed();
+    if elapsed.as_millis() >= SLOW_GCP_CREDENTIAL_LOG_THRESHOLD_MS {
+        warn!(
+            hostname,
+            elapsed_ms = elapsed.as_millis(),
+            error = response.as_ref().err().map(|x| x.to_string()),
+            "Slow GCP metadata email request"
+        );
+    }
+
+    Ok(response?)
 }
 
 /// A provider that uses the Google Cloud Platform metadata server to fetch a email for signing.
@@ -619,23 +652,39 @@ async fn get_token_response(
     client: &HttpClient,
     retry: &RetryConfig,
 ) -> Result<TokenResponse> {
-    client
-        .post(DEFAULT_TOKEN_GCP_URI)
-        .form([
-            ("grant_type", "refresh_token"),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("refresh_token", refresh_token),
-        ])
-        .retryable(retry)
-        .idempotent(true)
-        .send()
-        .await
-        .map_err(|source| Error::TokenRequest { source })?
-        .into_body()
-        .json::<TokenResponse>()
-        .await
-        .map_err(|source| Error::TokenResponseBody { source })
+    let start = Instant::now();
+    let response = async {
+        client
+            .post(DEFAULT_TOKEN_GCP_URI)
+            .form([
+                ("grant_type", "refresh_token"),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("refresh_token", refresh_token),
+            ])
+            .retryable(retry)
+            .idempotent(true)
+            .send()
+            .await
+            .map_err(|source| Error::TokenRequest { source })?
+            .into_body()
+            .json::<TokenResponse>()
+            .await
+            .map_err(|source| Error::TokenResponseBody { source })
+    }
+    .instrument(info_span!("gcp oauth token request"))
+    .await;
+
+    let elapsed = start.elapsed();
+    if elapsed.as_millis() >= SLOW_GCP_CREDENTIAL_LOG_THRESHOLD_MS {
+        warn!(
+            elapsed_ms = elapsed.as_millis(),
+            error = response.as_ref().err().map(|x| x.to_string()),
+            "Slow GCP OAuth token request"
+        );
+    }
+
+    response
 }
 
 impl AuthorizedUserSigningCredentials {

@@ -47,11 +47,14 @@ use http::{HeaderName, Method, StatusCode};
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::{Instrument, info_span, warn};
 
 const VERSION_HEADER: &str = "x-goog-generation";
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 const USER_DEFINED_METADATA_HEADER_PREFIX: &str = "x-goog-meta-";
 const STORAGE_CLASS: &str = "x-goog-storage-class";
+const SLOW_GCS_CREDENTIAL_LOG_THRESHOLD_MS: u128 = 500;
 
 static VERSION_MATCH: HeaderName = HeaderName::from_static("x-goog-if-generation-match");
 
@@ -157,10 +160,28 @@ impl GoogleCloudStorageConfig {
     }
 
     pub(crate) async fn get_credential(&self) -> Result<Option<Arc<GcpCredential>>> {
-        Ok(match self.skip_signature {
-            false => Some(self.credentials.get_credential().await?),
-            true => None,
-        })
+        let start = Instant::now();
+        let result = match self.skip_signature {
+            false => self
+                .credentials
+                .get_credential()
+                .instrument(info_span!("gcs credential get"))
+                .await
+                .map(Some),
+            true => Ok(None),
+        };
+
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() >= SLOW_GCS_CREDENTIAL_LOG_THRESHOLD_MS {
+            warn!(
+                skip_signature = self.skip_signature,
+                elapsed_ms = elapsed.as_millis(),
+                error = result.as_ref().err().map(|x| x.to_string()),
+                "Slow GCS credential get"
+            );
+        }
+
+        Ok(result?)
     }
 }
 
@@ -232,7 +253,16 @@ impl Request<'_> {
     }
 
     async fn send(self) -> Result<HttpResponse> {
-        let credential = self.config.credentials.get_credential().await?;
+        let credential = self
+            .config
+            .credentials
+            .get_credential()
+            .instrument(info_span!(
+                "gcs request credential get",
+                path = %self.path,
+                idempotent = self.idempotent
+            ))
+            .await?;
         let resp = self
             .builder
             .bearer_auth(&credential.bearer)
@@ -629,10 +659,14 @@ impl GetClient for GoogleCloudStorageClient {
         path: &Path,
         options: GetOptions,
     ) -> Result<HttpResponse> {
-        let credential = self.get_credential().await?;
+        let head = options.head;
+        let credential = self
+            .get_credential()
+            .instrument(info_span!("gcs get credential", path = %path, head))
+            .await?;
         let url = self.object_url(path);
 
-        let method = match options.head {
+        let method = match head {
             true => Method::HEAD,
             false => Method::GET,
         };
@@ -666,7 +700,13 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
         prefix: Option<&str>,
         opts: PaginatedListOptions,
     ) -> Result<PaginatedListResult> {
-        let credential = self.get_credential().await?;
+        let credential = self
+            .get_credential()
+            .instrument(info_span!(
+                "gcs list credential",
+                prefix = prefix.unwrap_or("")
+            ))
+            .await?;
         let url = format!("{}/{}", self.config.base_url, self.bucket_name_encoded);
 
         let mut query = Vec::with_capacity(5);

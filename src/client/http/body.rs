@@ -20,11 +20,16 @@ use crate::{PutPayload, collect_bytes};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use http::{Method, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, SizeHint};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
+use tracing::{Instrument, info_span, warn};
+
+const SLOW_HTTP_BODY_LOG_THRESHOLD_MS: u128 = 500;
 
 /// An HTTP Request
 pub type HttpRequest = http::Request<HttpRequestBody>;
@@ -163,9 +168,38 @@ impl Body for HttpRequestBody {
 /// An HTTP response
 pub type HttpResponse = http::Response<HttpResponseBody>;
 
+/// Trace context propagated from request dispatch to response body consumption.
+#[derive(Debug, Clone)]
+pub(crate) struct HttpTraceContext {
+    method: Method,
+    uri: Uri,
+    status: StatusCode,
+}
+
+impl HttpTraceContext {
+    pub(crate) fn new(method: Method, uri: Uri, status: StatusCode) -> Self {
+        Self {
+            method,
+            uri,
+            status,
+        }
+    }
+
+    fn host(&self) -> &str {
+        self.uri.host().unwrap_or("")
+    }
+
+    fn path(&self) -> &str {
+        self.uri.path()
+    }
+}
+
 /// The body of an [`HttpResponse`]
 #[derive(Debug)]
-pub struct HttpResponseBody(BoxBody<Bytes, HttpError>);
+pub struct HttpResponseBody {
+    inner: BoxBody<Bytes, HttpError>,
+    trace_context: Option<HttpTraceContext>,
+}
 
 impl HttpResponseBody {
     /// Create an [`HttpResponseBody`] from the provided [`Body`]
@@ -175,19 +209,60 @@ impl HttpResponseBody {
     where
         B: Body<Data = Bytes, Error = HttpError> + Send + Sync + 'static,
     {
-        Self(BoxBody::new(body))
+        Self {
+            inner: BoxBody::new(body),
+            trace_context: None,
+        }
+    }
+
+    pub(crate) fn with_trace_context<B>(body: B, trace_context: HttpTraceContext) -> Self
+    where
+        B: Body<Data = Bytes, Error = HttpError> + Send + Sync + 'static,
+    {
+        Self {
+            inner: BoxBody::new(body),
+            trace_context: Some(trace_context),
+        }
     }
 
     /// Collects this response into a [`Bytes`]
     pub async fn bytes(self) -> Result<Bytes, HttpError> {
-        let size_hint = self.0.size_hint().lower();
-        let s = self.0.into_data_stream();
-        collect_bytes(s, Some(size_hint)).await
+        let size_hint = self.inner.size_hint().lower();
+        let context = self.trace_context.clone();
+        let start = Instant::now();
+        let s = self.inner.into_data_stream();
+        let result = async { collect_bytes(s, Some(size_hint)).await }
+            .instrument(info_span!(
+                "object_store http response bytes",
+                method = context.as_ref().map(|x| x.method.as_str()),
+                host = context.as_ref().map(|x| x.host()),
+                path = context.as_ref().map(|x| x.path()),
+                status = context.as_ref().map(|x| x.status.as_u16()),
+                size_hint
+            ))
+            .await;
+
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() >= SLOW_HTTP_BODY_LOG_THRESHOLD_MS {
+            warn!(
+                method = context.as_ref().map(|x| x.method.as_str()),
+                host = context.as_ref().map(|x| x.host()),
+                path = context.as_ref().map(|x| x.path()),
+                status = context.as_ref().map(|x| x.status.as_u16()),
+                elapsed_ms = elapsed.as_millis(),
+                size_hint,
+                bytes = result.as_ref().map(|x| x.len()).unwrap_or_default(),
+                error = result.as_ref().err().map(|x| x.to_string()),
+                "Slow object_store HTTP response body read"
+            );
+        }
+
+        result
     }
 
     /// Returns a stream of this response data
     pub fn bytes_stream(self) -> BoxStream<'static, Result<Bytes, HttpError>> {
-        self.0.into_data_stream().boxed()
+        self.inner.into_data_stream().boxed()
     }
 
     /// Returns the response as a [`String`]
@@ -211,15 +286,15 @@ impl Body for HttpResponseBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        Pin::new(&mut self.0).poll_frame(cx)
+        Pin::new(&mut self.inner).poll_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.0.is_end_stream()
+        self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.0.size_hint()
+        self.inner.size_hint()
     }
 }
 

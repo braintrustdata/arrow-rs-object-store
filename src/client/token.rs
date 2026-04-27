@@ -18,6 +18,9 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tracing::{Instrument, info_span, warn};
+
+const SLOW_TOKEN_CACHE_LOG_THRESHOLD_MS: u128 = 500;
 
 /// A temporary authentication token with an associated expiry
 #[derive(Debug, Clone)]
@@ -68,6 +71,7 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<TemporaryToken<T>, E>> + Send,
     {
+        let total_start = Instant::now();
         let now = Instant::now();
         let is_token_valid = |entry: &CacheEntry<T>| {
             entry.token.expiry.is_none_or(|ttl| {
@@ -78,13 +82,42 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
             })
         };
 
-        if let Some(cache) = self.cache.read().await.as_ref()
-            && is_token_valid(cache)
         {
-            return Ok(cache.token.token.clone());
+            let lock_start = Instant::now();
+            let guard = self
+                .cache
+                .read()
+                .instrument(info_span!("object_store token cache read lock"))
+                .await;
+            let lock_elapsed = lock_start.elapsed();
+            if lock_elapsed.as_millis() >= SLOW_TOKEN_CACHE_LOG_THRESHOLD_MS {
+                warn!(
+                    elapsed_ms = lock_elapsed.as_millis(),
+                    "Slow object_store token cache read lock"
+                );
+            }
+
+            if let Some(cache) = guard.as_ref()
+                && is_token_valid(cache)
+            {
+                return Ok(cache.token.token.clone());
+            }
         }
 
-        let mut guard = self.cache.write().await;
+        let lock_start = Instant::now();
+        let mut guard = self
+            .cache
+            .write()
+            .instrument(info_span!("object_store token cache write lock"))
+            .await;
+        let lock_elapsed = lock_start.elapsed();
+        if lock_elapsed.as_millis() >= SLOW_TOKEN_CACHE_LOG_THRESHOLD_MS {
+            warn!(
+                elapsed_ms = lock_elapsed.as_millis(),
+                "Slow object_store token cache write lock"
+            );
+        }
+
         if let Some(cache) = guard.as_ref()
             && is_token_valid(cache)
         {
@@ -92,12 +125,31 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
             return Ok(cache.token.token.clone());
         }
 
-        let cached = f().await?;
+        let fetch_start = Instant::now();
+        let cached = f()
+            .instrument(info_span!("object_store token cache fetch"))
+            .await?;
+        let fetch_elapsed = fetch_start.elapsed();
+        if fetch_elapsed.as_millis() >= SLOW_TOKEN_CACHE_LOG_THRESHOLD_MS {
+            warn!(
+                elapsed_ms = fetch_elapsed.as_millis(),
+                "Slow object_store token cache fetch"
+            );
+        }
+
         let token = cached.token.clone();
         *guard = Some(CacheEntry {
             token: cached,
             fetched_at: Instant::now(),
         });
+
+        let total_elapsed = total_start.elapsed();
+        if total_elapsed.as_millis() >= SLOW_TOKEN_CACHE_LOG_THRESHOLD_MS {
+            warn!(
+                elapsed_ms = total_elapsed.as_millis(),
+                "Slow object_store token cache get_or_insert"
+            );
+        }
 
         Ok(token)
     }

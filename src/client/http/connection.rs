@@ -17,13 +17,17 @@
 
 use crate::ClientOptions;
 use crate::client::builder::{HttpRequestBuilder, RequestBuilderError};
-use crate::client::{HttpRequest, HttpResponse, HttpResponseBody};
+use crate::client::{HttpRequest, HttpResponse, HttpResponseBody, HttpTraceContext};
 use async_trait::async_trait;
 use http::{Method, Uri};
 use http_body_util::BodyExt;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::runtime::Handle;
+use tracing::{Instrument, info_span, warn};
+
+const SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS: u128 = 500;
 
 /// An HTTP protocol error
 ///
@@ -212,17 +216,52 @@ impl HttpClient {
 impl HttpService for reqwest::Client {
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         let (parts, body) = req.into_parts();
+        let method = parts.method.clone();
+        let uri = parts.uri.clone();
+        let host = uri.host().unwrap_or("").to_string();
+        let path = uri.path().to_string();
+        let request_body_bytes = body.content_length();
 
         let url = parts.uri.to_string().parse().unwrap();
         let mut req = reqwest::Request::new(parts.method, url);
         *req.headers_mut() = parts.headers;
         *req.body_mut() = Some(body.into_reqwest());
 
-        let r = self.execute(req).await.map_err(HttpError::reqwest)?;
+        let start = Instant::now();
+        let r = self
+            .execute(req)
+            .instrument(info_span!(
+                "object_store http execute",
+                method = %method,
+                host = %host,
+                path = %path,
+                request_body_bytes
+            ))
+            .await
+            .map_err(HttpError::reqwest)?;
+        let elapsed = start.elapsed();
+        let status = r.status();
+        let response_body_bytes = r.content_length();
+        if elapsed.as_millis() >= SLOW_HTTP_EXECUTE_LOG_THRESHOLD_MS {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path,
+                status = status.as_u16(),
+                elapsed_ms = elapsed.as_millis(),
+                request_body_bytes,
+                response_body_bytes,
+                "Slow object_store HTTP execute"
+            );
+        }
+
         let res: http::Response<reqwest::Body> = r.into();
         let (parts, body) = res.into_parts();
 
-        let body = HttpResponseBody::new(body.map_err(HttpError::reqwest));
+        let body = HttpResponseBody::with_trace_context(
+            body.map_err(HttpError::reqwest),
+            HttpTraceContext::new(method, uri, status),
+        );
         Ok(HttpResponse::from_parts(parts, body))
     }
 }

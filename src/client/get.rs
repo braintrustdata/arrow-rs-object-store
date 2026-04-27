@@ -36,7 +36,10 @@ use http_body_util::BodyExt;
 use reqwest::header::ToStrError;
 use std::ops::Range;
 use std::sync::Arc;
-use tracing::info;
+use std::time::Instant;
+use tracing::{Instrument, info, info_span, warn};
+
+const SLOW_GET_BODY_FRAME_LOG_THRESHOLD_MS: u128 = 500;
 
 /// A client that can perform a get request
 #[async_trait]
@@ -202,14 +205,57 @@ impl<T: GetClient> GetContext<T> {
         range: Range<u64>,
     ) -> BoxStream<'static, Result<Bytes>> {
         futures_util::stream::try_unfold(
-            (self, body, etag, range),
-            |(mut ctx, mut body, etag, mut range)| async move {
-                while let Some(ret) = body.frame().await {
+            (self, body, etag, range, Instant::now(), 0_u64, 0_u64),
+            |(mut ctx, mut body, etag, mut range, read_start, mut bytes_read, mut chunks)| async move {
+                loop {
+                    let frame_start = Instant::now();
+                    let next = body
+                        .frame()
+                        .instrument(info_span!(
+                            "object_store get body frame",
+                            path = %ctx.location,
+                            range_start = range.start,
+                            bytes_read,
+                            chunks
+                        ))
+                        .await;
+                    let frame_elapsed = frame_start.elapsed();
+                    if frame_elapsed.as_millis() >= SLOW_GET_BODY_FRAME_LOG_THRESHOLD_MS {
+                        warn!(
+                            path = %ctx.location,
+                            range_start = range.start,
+                            elapsed_ms = frame_elapsed.as_millis(),
+                            bytes_read,
+                            chunks,
+                            "Slow object_store GET body frame"
+                        );
+                    }
+
+                    let Some(ret) = next else {
+                        let elapsed = read_start.elapsed();
+                        if elapsed.as_millis() >= SLOW_GET_BODY_FRAME_LOG_THRESHOLD_MS {
+                            warn!(
+                                path = %ctx.location,
+                                elapsed_ms = elapsed.as_millis(),
+                                bytes_read,
+                                chunks,
+                                "Slow object_store GET body stream"
+                            );
+                        }
+                        return Ok(None);
+                    };
+
                     match (ret, &etag) {
                         (Ok(frame), _) => match frame.into_data() {
                             Ok(bytes) => {
-                                range.start += bytes.len() as u64;
-                                return Ok(Some((bytes, (ctx, body, etag, range))));
+                                let len = bytes.len() as u64;
+                                range.start += len;
+                                bytes_read += len;
+                                chunks += 1;
+                                return Ok(Some((
+                                    bytes,
+                                    (ctx, body, etag, range, read_start, bytes_read, chunks),
+                                )));
                             }
                             Err(_) => continue, // Isn't data frame
                         },

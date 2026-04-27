@@ -16,19 +16,28 @@
 // under the License.
 
 use std::net::ToSocketAddrs;
+use std::time::Instant;
 
 use rand::prelude::SliceRandom;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::task::JoinSet;
+use tracing::{Instrument, info_span, warn};
 
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
+
+const SLOW_DNS_RESOLVE_LOG_THRESHOLD_MS: u128 = 500;
 
 #[derive(Debug)]
 pub(crate) struct ShuffleResolver;
 
 impl Resolve for ShuffleResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        Box::pin(async move {
+        let host = name.as_str().to_string();
+        let host_for_span = host.clone();
+        let span = info_span!("object_store dns resolve", host = %host_for_span);
+        Box::pin(
+            async move {
+            let start = Instant::now();
             // use `JoinSet` to propagate cancelation to tasks that haven't started running yet.
             let mut tasks = JoinSet::new();
             tasks.spawn_blocking(move || {
@@ -40,11 +49,23 @@ impl Resolve for ShuffleResolver {
                 Ok(Box::new(addrs.into_iter()) as Addrs)
             });
 
-            tasks
-                .join_next()
-                .await
-                .expect("spawned on task")
-                .map_err(|err| Box::new(err) as DynErr)?
-        })
+            let result = match tasks.join_next().await.expect("spawned on task") {
+                Ok(Ok(addrs)) => Ok(addrs),
+                Ok(Err(err)) => Err(Box::new(err) as DynErr),
+                Err(err) => Err(Box::new(err) as DynErr),
+            };
+            let elapsed = start.elapsed();
+            if elapsed.as_millis() >= SLOW_DNS_RESOLVE_LOG_THRESHOLD_MS {
+                warn!(
+                    host = %host,
+                    elapsed_ms = elapsed.as_millis(),
+                    error = result.as_ref().err().map(|x| x.to_string()),
+                    "Slow object_store DNS resolve"
+                );
+            }
+                result
+            }
+            .instrument(span),
+        )
     }
 }

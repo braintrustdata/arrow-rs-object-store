@@ -747,6 +747,10 @@ impl ClientOptions {
     pub(crate) fn client(&self) -> Result<reqwest::Client> {
         let mut builder = reqwest::ClientBuilder::new();
 
+        if std::env::var_os("OBJECT_STORE_HTTP_CONNECTION_VERBOSE").is_some() {
+            builder = builder.connection_verbose(true);
+        }
+
         match &self.user_agent {
             Some(user_agent) => builder = builder.user_agent(user_agent.get()?),
             None => builder = builder.user_agent(DEFAULT_USER_AGENT),
@@ -944,6 +948,7 @@ mod cloud {
     use super::*;
     use crate::RetryConfig;
     use crate::client::token::{TemporaryToken, TokenCache};
+    use tracing::{Instrument, info_span};
 
     /// A [`CredentialProvider`] that uses [`HttpClient`] to fetch temporary tokens
     #[derive(Debug)]
@@ -977,8 +982,10 @@ mod cloud {
         type Credential = T::Credential;
 
         async fn get_credential(&self) -> Result<Arc<Self::Credential>> {
+            let provider = std::any::type_name::<T>();
             self.cache
                 .get_or_insert_with(|| self.inner.fetch_token(&self.client, &self.retry))
+                .instrument(info_span!("object_store credential get", provider))
                 .await
         }
     }
