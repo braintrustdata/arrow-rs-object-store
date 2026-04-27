@@ -48,13 +48,14 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_encode, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{Instrument, info_span, warn};
+use tracing::{Instrument, field, info_span, warn};
 
 const VERSION_HEADER: &str = "x-goog-generation";
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 const USER_DEFINED_METADATA_HEADER_PREFIX: &str = "x-goog-meta-";
 const STORAGE_CLASS: &str = "x-goog-storage-class";
 const SLOW_GCS_CREDENTIAL_LOG_THRESHOLD_MS: u128 = 500;
+const SLOW_GCS_FOOTER_REQUEST_LOG_THRESHOLD_MS: u128 = 500;
 
 static VERSION_MATCH: HeaderName = HeaderName::from_static("x-goog-if-generation-match");
 
@@ -660,6 +661,8 @@ impl GetClient for GoogleCloudStorageClient {
         options: GetOptions,
     ) -> Result<HttpResponse> {
         let head = options.head;
+        let is_footer = !head && matches!(path.extension(), Some("footer"));
+        let has_range = options.range.is_some();
         let credential = self
             .get_credential()
             .instrument(info_span!("gcs get credential", path = %path, head))
@@ -677,16 +680,64 @@ impl GetClient for GoogleCloudStorageClient {
             request = request.query(&[("generation", version)]);
         }
 
-        let response = request
+        let request = request
             .with_bearer_auth(credential.as_deref())
             .with_get_options(options)
-            .retryable_request()
-            .send(ctx)
-            .await
-            .map_err(|source| {
-                let path = path.as_ref().into();
-                Error::GetRequest { source, path }
-            })?;
+            .retryable_request();
+
+        let request_start = Instant::now();
+        let retries_before = ctx.retries();
+        let response = if is_footer {
+            let span = info_span!(
+                "gcs footer request",
+                path = %path,
+                head,
+                has_range,
+                retries_before,
+                retries_after = field::Empty,
+                max_retries = ctx.max_retries(),
+                elapsed_ms = field::Empty,
+                status = field::Empty,
+                error = field::Empty,
+            );
+            let result = async { request.send(ctx).await }
+                .instrument(span.clone())
+                .await;
+            let elapsed = request_start.elapsed();
+            let retries_after = ctx.retries();
+            let status = result
+                .as_ref()
+                .ok()
+                .map(|response| response.status().as_u16());
+            let error = result.as_ref().err().map(|error| error.to_string());
+            span.record("elapsed_ms", elapsed.as_millis() as u64);
+            span.record("retries_after", retries_after as u64);
+            if let Some(status) = status {
+                span.record("status", status);
+            }
+            if let Some(error) = &error {
+                span.record("error", error);
+            }
+            if elapsed.as_millis() >= SLOW_GCS_FOOTER_REQUEST_LOG_THRESHOLD_MS {
+                warn!(
+                    path = %path,
+                    elapsed_ms = elapsed.as_millis(),
+                    retries_before,
+                    retries_after,
+                    max_retries = ctx.max_retries(),
+                    status,
+                    error = error.as_deref(),
+                    "Slow GCS footer request"
+                );
+            }
+            result
+        } else {
+            request.send(ctx).await
+        }
+        .map_err(|source| {
+            let path = path.as_ref().into();
+            Error::GetRequest { source, path }
+        })?;
 
         Ok(response)
     }

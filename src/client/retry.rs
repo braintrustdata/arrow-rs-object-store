@@ -27,9 +27,11 @@ use reqwest::StatusCode;
 use reqwest::header::LOCATION;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{Instrument, debug, field, info, info_span, warn};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{Duration, Instant};
+
+const SLOW_FOOTER_HTTP_EXECUTE_LOG_THRESHOLD_MS: u128 = 500;
 
 /// Retry request error
 #[derive(Debug)]
@@ -102,6 +104,37 @@ impl RetryContext {
     pub(crate) fn backoff(&mut self) -> Duration {
         self.retries += 1;
         self.backoff.next()
+    }
+
+    pub(crate) fn retries(&self) -> usize {
+        self.retries
+    }
+
+    pub(crate) fn max_retries(&self) -> usize {
+        self.max_retries
+    }
+}
+
+struct FooterRequestFields {
+    method: Method,
+    host: String,
+    path: String,
+    range: Option<String>,
+}
+
+impl FooterRequestFields {
+    fn from_request(request: &HttpRequest) -> Option<Self> {
+        let path = request.uri().path();
+        (path.ends_with(".footer") || path.ends_with("%2Efooter")).then(|| Self {
+            method: request.method().clone(),
+            host: request.uri().host().unwrap_or("").to_string(),
+            path: path.to_string(),
+            range: request
+                .headers()
+                .get("range")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+        })
     }
 }
 
@@ -351,7 +384,61 @@ impl RetryableRequest {
                 *request.body_mut() = payload.clone().into();
             }
 
-            match self.client.execute(request).await {
+            let footer_request = FooterRequestFields::from_request(&request);
+            let execute_start = Instant::now();
+            let response = if let Some(fields) = &footer_request {
+                let span = info_span!(
+                    "object_store footer HTTP execute",
+                    method = %fields.method,
+                    host = %fields.host,
+                    path = %fields.path,
+                    range = fields.range.as_deref(),
+                    attempt = ctx.retries + 1,
+                    max_retries = ctx.max_retries,
+                    elapsed_ms = field::Empty,
+                    status = field::Empty,
+                    error_kind = field::Empty,
+                );
+                let result = async { self.client.execute(request).await }
+                    .instrument(span.clone())
+                    .await;
+                let elapsed = execute_start.elapsed();
+                let status = result
+                    .as_ref()
+                    .ok()
+                    .map(|response| response.status().as_u16());
+                let error_kind = result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("{:?}", error.kind()));
+                span.record("elapsed_ms", elapsed.as_millis() as u64);
+                if let Some(status) = status {
+                    span.record("status", status);
+                }
+                if let Some(error_kind) = &error_kind {
+                    span.record("error_kind", error_kind);
+                }
+                if elapsed.as_millis() >= SLOW_FOOTER_HTTP_EXECUTE_LOG_THRESHOLD_MS {
+                    warn!(
+                        method = %fields.method,
+                        host = %fields.host,
+                        path = %fields.path,
+                        range = fields.range.as_deref(),
+                        attempt = ctx.retries + 1,
+                        max_retries = ctx.max_retries,
+                        elapsed_ms = elapsed.as_millis(),
+                        status,
+                        error_kind = error_kind.as_deref(),
+                        error = result.as_ref().err().map(|error| error.to_string()),
+                        "Slow object_store footer HTTP execute"
+                    );
+                }
+                result
+            } else {
+                self.client.execute(request).await
+            };
+
+            match response {
                 Ok(r) => {
                     let status = r.status();
                     if status.is_success() {
