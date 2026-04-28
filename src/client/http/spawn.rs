@@ -52,6 +52,14 @@ fn footer_spawn_fields(req: &HttpRequest) -> Option<FooterSpawnFields> {
     })
 }
 
+fn current_thread_fields() -> (String, String) {
+    let thread = std::thread::current();
+    (
+        thread.name().unwrap_or("<unnamed>").to_string(),
+        format!("{:?}", thread.id()),
+    )
+}
+
 /// Spawn error
 #[derive(Debug, Error)]
 #[error("SpawnError")]
@@ -95,6 +103,7 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
 
         let worker_footer_fields = footer_fields.clone();
         let handle = SpawnHandle(self.runtime.spawn(async move {
+            let (worker_thread_name, worker_thread_id) = current_thread_fields();
             if let Some(fields) = &worker_footer_fields {
                 let elapsed = call_start.elapsed();
                 if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
@@ -102,6 +111,8 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
                         method = %fields.method,
                         host = %fields.host,
                         path = %fields.path,
+                        worker_thread_name = %worker_thread_name,
+                        worker_thread_id = %worker_thread_id,
                         elapsed_ms = elapsed.as_millis(),
                         "Slow object_store footer spawn handoff"
                     );
@@ -118,6 +129,8 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
                                 method = %fields.method,
                                 host = %fields.host,
                                 path = %fields.path,
+                                worker_thread_name = %worker_thread_name,
+                                worker_thread_id = %worker_thread_id,
                                 elapsed_ms = elapsed.as_millis(),
                                 "Slow object_store footer spawned inner HTTP call"
                             );
@@ -133,6 +146,8 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
                                 method = %fields.method,
                                 host = %fields.host,
                                 path = %fields.path,
+                                worker_thread_name = %worker_thread_name,
+                                worker_thread_id = %worker_thread_id,
                                 elapsed_ms = elapsed.as_millis(),
                                 error = %e,
                                 "Slow object_store footer spawned inner HTTP call"
@@ -169,6 +184,8 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
                             method = %fields.method,
                             host = %fields.host,
                             path = %fields.path,
+                            worker_thread_name = %worker_thread_name,
+                            worker_thread_id = %worker_thread_id,
                             elapsed_ms = elapsed.as_millis(),
                             frame_index,
                             frame_bytes,
@@ -191,6 +208,8 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
                         method = %fields.method,
                         host = %fields.host,
                         path = %fields.path,
+                        worker_thread_name = %worker_thread_name,
+                        worker_thread_id = %worker_thread_id,
                         elapsed_ms = elapsed.as_millis(),
                         frame_count = frame_index,
                         bytes_sent,
@@ -206,10 +225,13 @@ impl<T: HttpService + Clone> HttpService for SpawnService<T> {
             if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
                 let worker_elapsed = response_parts_ready_at.duration_since(call_start);
                 let response_parts_recv_lag = response_parts_ready_at.elapsed();
+                let (caller_thread_name, caller_thread_id) = current_thread_fields();
                 warn!(
                     method = %fields.method,
                     host = %fields.host,
                     path = %fields.path,
+                    caller_thread_name = %caller_thread_name,
+                    caller_thread_id = %caller_thread_id,
                     elapsed_ms = elapsed.as_millis(),
                     worker_elapsed_ms = worker_elapsed.as_millis(),
                     response_parts_recv_lag_ms = response_parts_recv_lag.as_millis(),
@@ -267,10 +289,13 @@ impl Body for SpawnBody {
                 if let (Some(fields), Some(pending_since)) = (footer_fields, pending_since) {
                     let elapsed = pending_since.elapsed();
                     if elapsed.as_millis() >= SLOW_FOOTER_SPAWN_LOG_THRESHOLD_MS {
+                        let (caller_thread_name, caller_thread_id) = current_thread_fields();
                         warn!(
                             method = %fields.method,
                             host = %fields.host,
                             path = %fields.path,
+                            caller_thread_name = %caller_thread_name,
+                            caller_thread_id = %caller_thread_id,
                             elapsed_ms = elapsed.as_millis(),
                             frame_index = self.frame_index,
                             "Slow object_store footer spawned body recv"
