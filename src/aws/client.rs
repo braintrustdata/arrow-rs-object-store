@@ -208,6 +208,7 @@ pub(crate) struct S3Config {
     pub copy_if_not_exists: Option<S3CopyIfNotExists>,
     pub conditional_put: S3ConditionalPut,
     pub request_payer: bool,
+    pub bucket_owner_full_control: bool,
     pub(super) encryption_headers: S3EncryptionHeaders,
 }
 
@@ -653,6 +654,9 @@ impl S3Client {
         } = opts;
 
         let mut request = self.request(Method::POST, location);
+        if self.config.bucket_owner_full_control {
+            request = request.header("x-amz-acl", "bucket-owner-full-control");
+        }
         if let Some(algorithm) = self.config.checksum {
             match algorithm {
                 Checksum::SHA256 => {
@@ -979,13 +983,25 @@ mod tests {
     use hyper::body::Incoming;
 
     #[tokio::test]
-    async fn test_create_multipart_has_content_length() {
+    async fn test_create_multipart_has_signed_acl() {
         let mock = MockServer::new().await;
 
         mock.push_fn(|req| {
             // Verify Content-Length header is present and set to 0
             assert_eq!(req.headers().get(CONTENT_LENGTH).unwrap(), "0");
             assert!(req.uri().query().unwrap_or("").contains("uploads"));
+            assert_eq!(
+                req.headers().get("x-amz-acl").unwrap(),
+                "bucket-owner-full-control"
+            );
+            assert!(
+                req.headers()
+                    .get(AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .contains("x-amz-acl")
+            );
 
             Response::builder()
                 .status(200)
@@ -1005,7 +1021,7 @@ mod tests {
             region: "us-east-1".to_string(),
             credentials: Arc::new(crate::StaticCredentialProvider::new(credential)),
             client_options: ClientOptions::new().with_allow_http(true),
-            skip_signature: true,
+            skip_signature: false,
             session_provider: None,
             retry_config: Default::default(),
             sign_payload: false,
@@ -1015,6 +1031,7 @@ mod tests {
             conditional_put: Default::default(),
             encryption_headers: Default::default(),
             request_payer: false,
+            bucket_owner_full_control: true,
         };
 
         let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
@@ -1070,6 +1087,7 @@ mod tests {
             conditional_put: Default::default(),
             encryption_headers: Default::default(),
             request_payer: false,
+            bucket_owner_full_control: false,
         }
     }
 

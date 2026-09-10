@@ -189,6 +189,8 @@ pub struct AmazonS3Builder {
     encryption_customer_key_base64: Option<String>,
     /// When set to true, charge requester for bucket operations
     request_payer: ConfigValue<bool>,
+    /// Grant the bucket owner full control over uploaded objects
+    bucket_owner_full_control: bool,
     /// The [`HttpConnector`] to use
     http_connector: Option<Arc<dyn HttpConnector>>,
 }
@@ -1020,6 +1022,13 @@ impl AmazonS3Builder {
         self
     }
 
+    /// Grant the bucket owner full control over objects created by `PutObject`
+    /// and `CreateMultipartUpload`.
+    pub fn with_bucket_owner_full_control(mut self) -> Self {
+        self.bucket_owner_full_control = true;
+        self
+    }
+
     /// Use SSE-KMS for server side encryption.
     pub fn with_sse_kms_encryption(mut self, kms_key_id: impl Into<String>) -> Self {
         self.encryption_type = Some(ConfigValue::Parsed(S3EncryptionType::SseKms));
@@ -1248,6 +1257,7 @@ impl AmazonS3Builder {
             conditional_put: self.conditional_put.get()?,
             encryption_headers,
             request_payer: self.request_payer.get()?,
+            bucket_owner_full_control: self.bucket_owner_full_control,
         };
 
         let http_client = http.connect(&config.client_options)?;
