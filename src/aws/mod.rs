@@ -169,7 +169,7 @@ impl ObjectStore for AmazonS3 {
             extensions,
         } = opts;
 
-        let request = self
+        let mut request = self
             .client
             .request(Method::PUT, location)
             .with_payload(payload)
@@ -177,6 +177,10 @@ impl ObjectStore for AmazonS3 {
             .with_tags(tags)
             .with_extensions(extensions)
             .with_encryption_headers();
+
+        if self.client.config.bucket_owner_full_control {
+            request = request.header("x-amz-acl", "bucket-owner-full-control");
+        }
 
         match (mode, &self.client.config.conditional_put) {
             (PutMode::Overwrite, _) => request.idempotent(true).do_put().await,
