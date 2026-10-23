@@ -1068,6 +1068,13 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>>;
 
+    /// List current objects, including version IDs when the backend supports version-aware listing.
+    /// S3 uses ListObjectVersions and requires s3:ListBucketVersions permission.
+    /// Other stores use their ordinary listing and may omit version IDs.
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.list(prefix)
+    }
+
     /// List all versions and delete markers of one exact key, newest versions first.
     /// Currently supported by S3. Other stores return `NotSupported`.
     async fn list_versions(&self, _location: &Path) -> Result<Vec<ObjectVersion>> {
@@ -1228,6 +1235,13 @@ macro_rules! as_ref_impl {
 
             async fn list_versions(&self, location: &Path) -> Result<Vec<ObjectVersion>> {
                 self.as_ref().list_versions(location).await
+            }
+
+            fn list_with_versions(
+                &self,
+                prefix: Option<&Path>,
+            ) -> BoxStream<'static, Result<ObjectMeta>> {
+                self.as_ref().list_with_versions(prefix)
             }
 
             fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -2312,6 +2326,87 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        mock.shutdown().await;
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_list_with_versions_and_delete_without_head_through_wrappers() {
+        use http_body_util::BodyExt;
+        let mock = client::mock_server::MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_eq!(req.method(), ::http::Method::GET);
+            let url = url::Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
+            let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(pairs.get("prefix").unwrap(), "prefix/markers/");
+            assert!(pairs.contains_key("versions"));
+            assert!(!pairs.contains_key("key-marker"));
+            ::http::Response::builder().status(200).body(r#"<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>prefix/markers/b</NextKeyMarker><NextVersionIdMarker>b&amp;1</NextVersionIdMarker><Version><Key>prefix/markers/a</Key><VersionId>a2</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T12:00:01Z</LastModified><Size>7</Size><ETag>"etag-a"</ETag></Version><Version><Key>prefix/markers/a</Key><VersionId>a1</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-22T12:00:00Z</LastModified></Version><DeleteMarker><Key>prefix/markers/b</Key><VersionId>b2</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T12:00:01Z</LastModified></DeleteMarker></ListVersionsResult>"#.to_string()).unwrap()
+        });
+        mock.push_fn(|req| {
+            assert_eq!(req.method(), ::http::Method::GET);
+            let url = url::Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
+            let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(pairs.get("key-marker").unwrap(), "prefix/markers/b");
+            assert_eq!(pairs.get("version-id-marker").unwrap(), "b&1");
+            ::http::Response::builder().status(200).body("<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>prefix/markers/c</NextKeyMarker><Version><Key>prefix/markers/b</Key><VersionId>b1</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-22T12:00:00Z</LastModified></Version></ListVersionsResult>".to_string()).unwrap()
+        });
+        mock.push_fn(|req| {
+            assert_eq!(req.method(), ::http::Method::GET);
+            let url = url::Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
+            let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(pairs.get("key-marker").unwrap(), "prefix/markers/c");
+            assert!(!pairs.contains_key("version-id-marker"));
+            ::http::Response::builder().status(200).body("<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>prefix/markers/d</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T12:00:00Z</LastModified></Version></ListVersionsResult>".to_string()).unwrap()
+        });
+        let s3 = aws::AmazonS3Builder::new()
+            .with_bucket_name("test")
+            .with_region("us-east-1")
+            .with_endpoint(mock.url())
+            .with_allow_http(true)
+            .with_skip_signature(true)
+            .build()
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(s3);
+        let store = prefix::PrefixStore::new(store, "prefix");
+        let store = limit::LimitStore::new(store, 1);
+        let store = throttle::ThrottledStore::new(store, Default::default());
+        let store = chunked::ChunkedStore::new(Arc::new(store), 10);
+        let store: Box<dyn ObjectStore> = Box::new(store);
+        let objects = store
+            .list_with_versions(Some(&Path::from("markers")))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].location, Path::from("markers/a"));
+        assert_eq!(objects[0].version.as_deref(), Some("a2"));
+        assert_eq!(objects[0].size, 7);
+        assert_eq!(objects[0].e_tag.as_deref(), Some("\"etag-a\""));
+        assert_eq!(objects[1].version.as_deref(), Some("null"));
+        mock.push_async_fn(|req| async move {
+            assert_eq!(req.method(), ::http::Method::POST);
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("<Key>prefix/markers/a</Key><VersionId>a2</VersionId>"));
+            assert!(body.contains("<Key>prefix/markers/d</Key><VersionId>null</VersionId>"));
+            ::http::Response::builder().status(200).body("<DeleteResult><Deleted><Key>prefix/markers/a</Key><VersionId>a2</VersionId></Deleted><Deleted><Key>prefix/markers/d</Key><VersionId>null</VersionId></Deleted></DeleteResult>".to_string()).unwrap()
+        });
+        let targets = futures_util::stream::iter(objects.into_iter().map(|meta| {
+            Ok((
+                meta.location,
+                DeleteOptions {
+                    version: meta.version,
+                },
+            ))
+        }))
+        .boxed();
+        let deleted = store
+            .delete_stream_opts(targets)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(deleted, [Path::from("markers/a"), Path::from("markers/d")]);
         mock.shutdown().await;
     }
 

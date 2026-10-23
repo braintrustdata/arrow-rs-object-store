@@ -302,6 +302,10 @@ impl ObjectStore for AmazonS3 {
             .boxed()
     }
 
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.client.list_with_versions(prefix)
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.client.list(prefix)
     }

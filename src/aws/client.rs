@@ -43,6 +43,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::{Buf, Bytes};
+use futures_util::{StreamExt, TryStreamExt, stream::BoxStream};
 use http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
     CONTENT_TYPE,
@@ -480,6 +481,10 @@ struct ListVersion {
     version_id: String,
     last_modified: chrono::DateTime<chrono::Utc>,
     is_latest: bool,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    e_tag: Option<String>,
 }
 
 impl S3Client {
@@ -506,37 +511,104 @@ impl S3Client {
         }
     }
 
+    async fn list_versions_page(
+        &self,
+        prefix: &str,
+        key_marker: Option<&String>,
+        version_marker: Option<&String>,
+    ) -> Result<ListVersionsResponse> {
+        let credential = self.config.get_session_credential().await?;
+        let mut query = vec![("versions", ""), ("prefix", prefix)];
+        if let Some(marker) = key_marker {
+            query.push(("key-marker", marker));
+        }
+        if let Some(marker) = version_marker {
+            query.push(("version-id-marker", marker));
+        }
+        let mut builder = self
+            .client
+            .request(Method::GET, &self.config.bucket_endpoint);
+        if let Some(headers) = self.config.client_options.get_default_headers() {
+            builder = builder.headers(headers.clone());
+        }
+        let response = builder
+            .query(&query)
+            .with_aws_sigv4(credential.authorizer(), None)
+            .send_retry(&self.config.retry_config)
+            .await
+            .map_err(|source| Error::ListRequest { source })?
+            .into_body()
+            .bytes()
+            .await
+            .map_err(|source| Error::ListResponseBody { source })?;
+        let page: ListVersionsResponse = quick_xml::de::from_reader(response.reader())
+            .map_err(|source| Error::InvalidListResponse { source })?;
+        if page.is_truncated
+            && (page.next_key_marker.is_none()
+                || (
+                    page.next_key_marker.as_ref(),
+                    page.next_version_id_marker.as_ref(),
+                ) == (key_marker, version_marker))
+        {
+            return Err(crate::Error::Generic {
+                store: STORE,
+                source: "Truncated version listing did not advance pagination markers".into(),
+            });
+        }
+        Ok(page)
+    }
+
+    pub(crate) fn list_with_versions(
+        self: &Arc<Self>,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<crate::ObjectMeta>> {
+        let prefix = prefix
+            .filter(|p| !p.as_ref().is_empty())
+            .map(|p| format!("{}/", p.as_ref()))
+            .unwrap_or_default();
+        let client = Arc::clone(self);
+        futures_util::stream::try_unfold(Some((None, None)), move |state| {
+            let client = Arc::clone(&client);
+            let prefix = prefix.clone();
+            async move {
+                let Some((key, version)) = state else {
+                    return Ok::<_, crate::Error>(None);
+                };
+                let page = client
+                    .list_versions_page(&prefix, key.as_ref(), version.as_ref())
+                    .await?;
+                let next = page
+                    .is_truncated
+                    .then_some((page.next_key_marker, page.next_version_id_marker));
+                let objects = page
+                    .version
+                    .into_iter()
+                    .filter(|entry| entry.is_latest)
+                    .map(|entry| {
+                        Ok(crate::ObjectMeta {
+                            location: Path::parse(entry.key)?,
+                            last_modified: entry.last_modified,
+                            size: entry.size,
+                            e_tag: entry.e_tag,
+                            version: Some(entry.version_id),
+                        })
+                    })
+                    .collect::<Vec<Result<_>>>();
+                Ok(Some((futures_util::stream::iter(objects), next)))
+            }
+        })
+        .try_flatten()
+        .boxed()
+    }
+
     pub(crate) async fn list_versions(&self, path: &Path) -> Result<Vec<crate::ObjectVersion>> {
         let mut versions = Vec::new();
         let mut key_marker: Option<String> = None;
         let mut version_marker: Option<String> = None;
         loop {
-            let credential = self.config.get_session_credential().await?;
-            let mut query = vec![("versions", ""), ("prefix", path.as_ref())];
-            if let Some(marker) = &key_marker {
-                query.push(("key-marker", marker));
-            }
-            if let Some(marker) = &version_marker {
-                query.push(("version-id-marker", marker));
-            }
-            let mut builder = self
-                .client
-                .request(Method::GET, &self.config.bucket_endpoint);
-            if let Some(headers) = self.config.client_options.get_default_headers() {
-                builder = builder.headers(headers.clone());
-            }
-            let response = builder
-                .query(&query)
-                .with_aws_sigv4(credential.authorizer(), None)
-                .send_retry(&self.config.retry_config)
-                .await
-                .map_err(|source| Error::ListRequest { source })?
-                .into_body()
-                .bytes()
-                .await
-                .map_err(|source| Error::ListResponseBody { source })?;
-            let page: ListVersionsResponse = quick_xml::de::from_reader(response.reader())
-                .map_err(|source| Error::InvalidListResponse { source })?;
+            let page = self
+                .list_versions_page(path.as_ref(), key_marker.as_ref(), version_marker.as_ref())
+                .await?;
             for (entries, is_delete_marker) in [(page.version, false), (page.delete_marker, true)] {
                 versions.extend(
                     entries
@@ -554,15 +626,6 @@ impl S3Client {
                 break;
             }
             let next = (page.next_key_marker, page.next_version_id_marker);
-            if next.0.is_none()
-                || next.1.is_none()
-                || next == (key_marker.clone(), version_marker.clone())
-            {
-                return Err(crate::Error::Generic {
-                    store: STORE,
-                    source: "Truncated version listing did not advance pagination markers".into(),
-                });
-            }
             (key_marker, version_marker) = next;
         }
         Ok(versions)
@@ -1322,6 +1385,32 @@ mod tests {
             HttpClient::new(reqwest::Client::new()),
         );
         assert!(client.list_versions(&Path::from("marker")).await.is_err());
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_with_versions_rejects_nonadvancing_pagination() {
+        let mock = MockServer::new().await;
+        let page = "<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>marker</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker></ListVersionsResult>";
+        for _ in 0..2 {
+            mock.push(
+                Response::builder()
+                    .status(200)
+                    .body(page.to_string())
+                    .unwrap(),
+            );
+        }
+        let client = Arc::new(S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        ));
+        assert!(
+            client
+                .list_with_versions(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .is_err()
+        );
         mock.shutdown().await;
     }
 

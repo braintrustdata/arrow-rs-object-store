@@ -161,6 +161,10 @@ impl ObjectStore for ChunkedStore {
         self.inner.delete_stream_opts(locations)
     }
 
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.inner.list_with_versions(prefix)
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner.list(prefix)
     }

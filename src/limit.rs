@@ -143,6 +143,18 @@ impl<T: ObjectStore> ObjectStore for LimitStore<T> {
         fut.into_stream().flatten().boxed()
     }
 
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        let prefix = prefix.cloned();
+        let inner = Arc::clone(&self.inner);
+        let fut = Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .map(move |permit| {
+                let s = inner.list_with_versions(prefix.as_ref());
+                PermitWrapper::new(s, permit.unwrap())
+            });
+        fut.into_stream().flatten().boxed()
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let prefix = prefix.cloned();
         let inner = Arc::clone(&self.inner);

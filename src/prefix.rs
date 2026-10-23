@@ -89,7 +89,7 @@ fn strip_meta(prefix: &Path, meta: ObjectMeta) -> ObjectMeta {
         size: meta.size,
         location: strip_prefix(prefix, meta.location),
         e_tag: meta.e_tag,
-        version: None,
+        version: meta.version,
     }
 }
 
@@ -163,6 +163,13 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
             .delete_stream_opts(locations)
             .map(move |location| location.map(|loc| strip_prefix(&prefix, loc)))
             .boxed()
+    }
+
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        let prefix = self.full_path(prefix.unwrap_or(&Path::default()));
+        let s = self.inner.list_with_versions(Some(&prefix));
+        let slf_prefix = self.prefix.clone();
+        s.map_ok(move |meta| strip_meta(&slf_prefix, meta)).boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
