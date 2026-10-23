@@ -1068,6 +1068,14 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>>;
 
+    /// List all versions and delete markers of one exact key, newest versions first.
+    /// Currently supported by S3. Other stores return `NotSupported`.
+    async fn list_versions(&self, _location: &Path) -> Result<Vec<ObjectVersion>> {
+        Err(Error::NotSupported {
+            source: "Listing object versions is not supported by this store".into(),
+        })
+    }
+
     /// Delete objects with optional version IDs, preserving input order and native batching.
     /// Stores without version support reject versioned targets instead of deleting the current object.
     fn delete_stream_opts(
@@ -1212,6 +1220,10 @@ macro_rules! as_ref_impl {
                 locations: BoxStream<'static, Result<(Path, DeleteOptions)>>,
             ) -> BoxStream<'static, Result<Path>> {
                 self.as_ref().delete_stream_opts(locations)
+            }
+
+            async fn list_versions(&self, location: &Path) -> Result<Vec<ObjectVersion>> {
+                self.as_ref().list_versions(location).await
             }
 
             fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -1453,6 +1465,19 @@ pub struct ListResult {
     pub common_prefixes: Vec<Path>,
     /// Object metadata for the listing
     pub objects: Vec<ObjectMeta>,
+}
+
+/// A historical version or delete marker for an exact object key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersion {
+    /// The provider's version identifier.
+    pub version_id: String,
+    /// When this version or delete marker was written.
+    pub last_modified: DateTime<Utc>,
+    /// Whether the entry is a delete marker instead of object data.
+    pub is_delete_marker: bool,
+    /// Whether the entry is the current version of the key.
+    pub is_latest: bool,
 }
 
 /// Options controlling which object version is deleted.
@@ -2261,6 +2286,28 @@ mod tests {
             )
             .await
             .unwrap();
+        mock.push_fn(|req| {
+            assert!(
+                req.uri()
+                    .query()
+                    .unwrap()
+                    .contains("prefix=prefix%2Fmarker")
+            );
+            ::http::Response::builder()
+                .status(200)
+                .body(
+                    "<ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>"
+                        .to_string(),
+                )
+                .unwrap()
+        });
+        assert!(
+            store
+                .list_versions(&Path::from("marker"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mock.shutdown().await;
     }
 

@@ -140,6 +140,10 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
             .boxed()
     }
 
+    async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
+        self.inner.list_versions(&self.full_path(location)).await
+    }
+
     fn delete_stream_opts(
         &self,
         locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,

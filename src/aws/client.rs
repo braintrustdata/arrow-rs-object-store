@@ -461,6 +461,27 @@ pub(crate) struct S3Client {
     pub client: HttpClient,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListVersionsResponse {
+    #[serde(default)]
+    version: Vec<ListVersion>,
+    #[serde(default)]
+    delete_marker: Vec<ListVersion>,
+    is_truncated: bool,
+    next_key_marker: Option<String>,
+    next_version_id_marker: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListVersion {
+    key: String,
+    version_id: String,
+    last_modified: chrono::DateTime<chrono::Utc>,
+    is_latest: bool,
+}
+
 impl S3Client {
     pub(crate) fn new(config: S3Config, client: HttpClient) -> Self {
         Self { config, client }
@@ -483,6 +504,68 @@ impl S3Client {
             retry_on_conflict: false,
             retry_error_body: false,
         }
+    }
+
+    pub(crate) async fn list_versions(&self, path: &Path) -> Result<Vec<crate::ObjectVersion>> {
+        let mut versions = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut version_marker: Option<String> = None;
+        loop {
+            let credential = self.config.get_session_credential().await?;
+            let mut query = vec![("versions", ""), ("prefix", path.as_ref())];
+            if let Some(marker) = &key_marker {
+                query.push(("key-marker", marker));
+            }
+            if let Some(marker) = &version_marker {
+                query.push(("version-id-marker", marker));
+            }
+            let mut builder = self
+                .client
+                .request(Method::GET, &self.config.bucket_endpoint);
+            if let Some(headers) = self.config.client_options.get_default_headers() {
+                builder = builder.headers(headers.clone());
+            }
+            let response = builder
+                .query(&query)
+                .with_aws_sigv4(credential.authorizer(), None)
+                .send_retry(&self.config.retry_config)
+                .await
+                .map_err(|source| Error::ListRequest { source })?
+                .into_body()
+                .bytes()
+                .await
+                .map_err(|source| Error::ListResponseBody { source })?;
+            let page: ListVersionsResponse = quick_xml::de::from_reader(response.reader())
+                .map_err(|source| Error::InvalidListResponse { source })?;
+            for (entries, is_delete_marker) in [(page.version, false), (page.delete_marker, true)] {
+                versions.extend(
+                    entries
+                        .into_iter()
+                        .filter(|entry| entry.key == path.as_ref())
+                        .map(|entry| crate::ObjectVersion {
+                            version_id: entry.version_id,
+                            last_modified: entry.last_modified,
+                            is_latest: entry.is_latest,
+                            is_delete_marker,
+                        }),
+                );
+            }
+            if !page.is_truncated {
+                break;
+            }
+            let next = (page.next_key_marker, page.next_version_id_marker);
+            if next.0.is_none()
+                || next.1.is_none()
+                || next == (key_marker.clone(), version_marker.clone())
+            {
+                return Err(crate::Error::Generic {
+                    store: STORE,
+                    source: "Truncated version listing did not advance pagination markers".into(),
+                });
+            }
+            (key_marker, version_marker) = next;
+        }
+        Ok(versions)
     }
 
     /// Make an S3 Delete Objects request <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html>
@@ -1185,6 +1268,60 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_versions_pagination_and_exact_key() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_default_headers_signed(&req);
+            assert!(req.uri().query().unwrap().contains("versions="));
+            assert!(!req.uri().query().unwrap().contains("key-marker"));
+            Response::builder().status(200).body("<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>marker</NextKeyMarker><NextVersionIdMarker>v&amp;1</NextVersionIdMarker><Version><Key>marker</Key><VersionId>v2</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T12:00:01Z</LastModified></Version><Version><Key>marker-sibling</Key><VersionId>ignored</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T12:00:00Z</LastModified></Version></ListVersionsResult>".to_string()).unwrap()
+        });
+        mock.push_fn(|req| {
+            let url = url::Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
+            let pairs: std::collections::HashMap<_,_> = url.query_pairs().into_owned().collect();
+            assert_eq!(pairs.get("key-marker").unwrap(), "marker");
+            assert_eq!(pairs.get("version-id-marker").unwrap(), "v&1");
+            Response::builder().status(200).body("<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>marker</Key><VersionId>v1</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-22T12:00:00Z</LastModified></Version><DeleteMarker><Key>marker</Key><VersionId>d1</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-22T12:00:00Z</LastModified></DeleteMarker></ListVersionsResult>".to_string()).unwrap()
+        });
+        let client = S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        );
+        let versions = client.list_versions(&Path::from("marker")).await.unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|entry| entry.version_id.as_str())
+                .collect::<Vec<_>>(),
+            ["v2", "v1", "d1"]
+        );
+        assert!(versions[0].is_latest);
+        assert!(!versions[1].is_delete_marker);
+        assert!(versions[2].is_delete_marker);
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_versions_rejects_missing_pagination_markers() {
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .status(200)
+                .body(
+                    "<ListVersionsResult><IsTruncated>true</IsTruncated></ListVersionsResult>"
+                        .to_string(),
+                )
+                .unwrap(),
+        );
+        let client = S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        );
+        assert!(client.list_versions(&Path::from("marker")).await.is_err());
         mock.shutdown().await;
     }
 
