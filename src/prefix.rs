@@ -89,7 +89,7 @@ fn strip_meta(prefix: &Path, meta: ObjectMeta) -> ObjectMeta {
         size: meta.size,
         location: strip_prefix(prefix, meta.location),
         e_tag: meta.e_tag,
-        version: None,
+        version: meta.version,
     }
 }
 
@@ -129,15 +129,43 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        self.delete_stream_opts(
+            locations
+                .map(|location| location.map(|path| (path, crate::DeleteOptions::default())))
+                .boxed(),
+        )
+    }
+
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
         let prefix = self.prefix.clone();
         let locations = locations
-            .map(move |location| location.map(|loc| full_path(&prefix, &loc)))
+            .map(move |location| location.map(|(loc, options)| (full_path(&prefix, &loc), options)))
             .boxed();
         let prefix = self.prefix.clone();
         self.inner
-            .delete_stream(locations)
+            .delete_stream_opts(locations)
             .map(move |location| location.map(|loc| strip_prefix(&prefix, loc)))
             .boxed()
+    }
+
+    async fn delete_opts(&self, location: &Path, options: crate::DeleteOptions) -> Result<()> {
+        self.inner
+            .delete_opts(&self.full_path(location), options)
+            .await
+    }
+
+    async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
+        self.inner.list_versions(&self.full_path(location)).await
+    }
+
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        let prefix = self.full_path(prefix.unwrap_or(&Path::default()));
+        let s = self.inner.list_with_versions(Some(&prefix));
+        let slf_prefix = self.prefix.clone();
+        s.map_ok(move |meta| strip_meta(&slf_prefix, meta)).boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {

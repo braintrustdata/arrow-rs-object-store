@@ -146,6 +146,25 @@ impl ObjectStore for ChunkedStore {
         self.inner.delete_stream(locations)
     }
 
+    async fn delete_opts(&self, location: &Path, options: crate::DeleteOptions) -> Result<()> {
+        self.inner.delete_opts(location, options).await
+    }
+
+    async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
+        self.inner.list_versions(location).await
+    }
+
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        self.inner.delete_stream_opts(locations)
+    }
+
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.inner.list_with_versions(prefix)
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner.list(prefix)
     }

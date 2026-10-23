@@ -200,13 +200,47 @@ impl<T: ObjectStore> ObjectStore for ThrottledStore<T> {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        self.delete_stream_opts(
+            locations
+                .map(|location| location.map(|path| (path, crate::DeleteOptions::default())))
+                .boxed(),
+        )
+    }
+
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
         // We wait for a certain duration before each delete location.
         // This may be suboptimal if the inner store implements batch deletes.
         // But there is no way around unnecessary waits since we do not know
         // how the inner store implements `delete_stream`.
         let wait_delete_per_call = self.config().wait_delete_per_call;
         let locations = throttle_stream(locations, move |_| wait_delete_per_call);
-        self.inner.delete_stream(locations)
+        self.inner.delete_stream_opts(locations)
+    }
+
+    async fn delete_opts(&self, location: &Path, options: crate::DeleteOptions) -> Result<()> {
+        sleep(self.config().wait_delete_per_call).await;
+        self.inner.delete_opts(location, options).await
+    }
+
+    async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
+        sleep(self.config().wait_list_per_call).await;
+        self.inner.list_versions(location).await
+    }
+
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        let stream = self.inner.list_with_versions(prefix);
+        let config = Arc::clone(&self.config);
+        futures_util::stream::once(async move {
+            let config = *config.lock();
+            let wait_list_per_entry = config.wait_list_per_entry;
+            sleep(config.wait_list_per_call).await;
+            throttle_stream(stream, move |_| wait_list_per_entry)
+        })
+        .flatten()
+        .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {

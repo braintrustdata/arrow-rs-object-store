@@ -109,11 +109,44 @@ impl<T: ObjectStore> ObjectStore for LimitStore<T> {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        self.delete_stream_opts(
+            locations
+                .map(|location| location.map(|path| (path, crate::DeleteOptions::default())))
+                .boxed(),
+        )
+    }
+
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
         let inner = Arc::clone(&self.inner);
         let fut = Arc::clone(&self.semaphore)
             .acquire_owned()
             .map(move |permit| {
-                let s = inner.delete_stream(locations);
+                let s = inner.delete_stream_opts(locations);
+                PermitWrapper::new(s, permit.unwrap())
+            });
+        fut.into_stream().flatten().boxed()
+    }
+
+    async fn delete_opts(&self, location: &Path, options: crate::DeleteOptions) -> Result<()> {
+        let _permit = self.semaphore.acquire().await.unwrap();
+        self.inner.delete_opts(location, options).await
+    }
+
+    async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
+        let _permit = self.semaphore.acquire().await.unwrap();
+        self.inner.list_versions(location).await
+    }
+
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        let prefix = prefix.cloned();
+        let inner = Arc::clone(&self.inner);
+        let fut = Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .map(move |permit| {
+                let s = inner.list_with_versions(prefix.as_ref());
                 PermitWrapper::new(s, permit.unwrap())
             });
         fut.into_stream().flatten().boxed()

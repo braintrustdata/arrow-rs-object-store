@@ -145,6 +145,17 @@ impl ObjectStore for MicrosoftAzure {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        self.delete_stream_opts(
+            locations
+                .map_ok(|path| (path, crate::DeleteOptions::default()))
+                .boxed(),
+        )
+    }
+
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
         let client = Arc::clone(&self.client);
         locations
             .try_chunks(256)
@@ -375,6 +386,77 @@ mod tests {
         if !integration.client.config().is_emulator {
             put_get_attributes(&integration).await;
         }
+    }
+
+    #[ignore = "Requires a real Azure account with blob versioning enabled"]
+    #[tokio::test]
+    async fn azure_versioned_delete_preserves_replacement() {
+        let store = MicrosoftAzureBuilder::from_env().build().unwrap();
+        assert!(
+            !store.client.config().is_emulator,
+            "Azurite cannot validate blob versioning"
+        );
+        let path = Path::from(format!(
+            "versioned-delete-test-{:032x}",
+            rand::random::<u128>()
+        ));
+        let first = store.put(&path, "first".into()).await.unwrap();
+        let first_version = first
+            .version
+            .expect("The test account must have blob versioning enabled");
+        store
+            .delete_opts(
+                &path,
+                crate::DeleteOptions {
+                    version: Some(first_version.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.head(&path).await,
+            Err(crate::Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            store
+                .get_opts(&path, GetOptions::new().with_version(Some(first_version)))
+                .await,
+            Err(crate::Error::NotFound { .. })
+        ));
+
+        let old = store.put(&path, "old".into()).await.unwrap();
+        let replacement = store.put(&path, "replacement".into()).await.unwrap();
+        let replacement_version = replacement.version.clone().unwrap();
+        store
+            .delete_opts(
+                &path,
+                crate::DeleteOptions {
+                    version: old.version,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.head(&path).await.unwrap().version,
+            replacement.version
+        );
+        assert_eq!(
+            store.get(&path).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"replacement")
+        );
+        store
+            .delete_opts(
+                &path,
+                crate::DeleteOptions {
+                    version: Some(replacement_version),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.head(&path).await,
+            Err(crate::Error::NotFound { .. })
+        ));
     }
 
     #[ignore = "Used for manual testing against a real storage account."]

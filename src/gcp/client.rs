@@ -560,8 +560,16 @@ impl GoogleCloudStorageClient {
     }
 
     /// Perform a delete request <https://cloud.google.com/storage/docs/xml-api/delete-object>
-    pub(crate) async fn delete_request(&self, path: &Path) -> Result<()> {
-        self.request(Method::DELETE, path).send().await?;
+    pub(crate) async fn delete_request(
+        &self,
+        path: &Path,
+        options: crate::DeleteOptions,
+    ) -> Result<()> {
+        let mut request = self.request(Method::DELETE, path);
+        if let Some(version) = &options.version {
+            request = request.query(&[("generation", version)]);
+        }
+        request.send().await?;
         Ok(())
     }
 
@@ -719,5 +727,103 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
             result: response.try_into()?,
             page_token: token,
         })
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use crate::client::mock_server::MockServer;
+    use crate::{DeleteOptions, ObjectStore, StaticCredentialProvider};
+    use futures_util::TryStreamExt;
+
+    fn test_store(mock: &MockServer) -> crate::gcp::GoogleCloudStorage {
+        let config = GoogleCloudStorageConfig {
+            base_url: mock.url().to_string(),
+            credentials: Arc::new(StaticCredentialProvider::new(GcpCredential {
+                bearer: "unused".into(),
+            })),
+            signing_credentials: Arc::new(StaticCredentialProvider::new(
+                crate::gcp::GcpSigningCredential {
+                    email: "unused".into(),
+                    private_key: None,
+                },
+            )),
+            bucket_name: "test".into(),
+            retry_config: Default::default(),
+            client_options: ClientOptions::new().with_allow_http(true),
+            skip_signature: true,
+        };
+        crate::gcp::GoogleCloudStorage {
+            client: Arc::new(
+                GoogleCloudStorageClient::new(config, HttpClient::new(reqwest::Client::new()))
+                    .unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_listed_generation_can_be_deleted_without_head() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_eq!(req.method(), Method::GET);
+            assert_eq!(req.uri().path(), "/test");
+            assert!(req.uri().query().unwrap().contains("list-type=2"));
+            http::Response::builder().status(200).body(
+                "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>marker</Key><Generation>18446744073709551615</Generation><LastModified>2026-10-22T00:00:00Z</LastModified><Size>1</Size></Contents></ListBucketResult>".to_string()
+            ).unwrap()
+        });
+        mock.push_fn(|req| {
+            assert_eq!(req.method(), Method::DELETE);
+            assert_eq!(req.uri().path(), "/test/marker");
+            assert_eq!(req.uri().query(), Some("generation=18446744073709551615"));
+            http::Response::builder()
+                .status(204)
+                .body(String::new())
+                .unwrap()
+        });
+        let store = test_store(&mock);
+        let objects: Vec<_> = store.list(None).try_collect().await.unwrap();
+        assert_eq!(objects.len(), 1);
+        let meta = objects.into_iter().next().unwrap();
+        assert_eq!(meta.version.as_deref(), Some("18446744073709551615"));
+        store
+            .delete_opts(
+                &meta.location,
+                DeleteOptions {
+                    version: meta.version,
+                },
+            )
+            .await
+            .unwrap();
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_generation_query() {
+        let mock = MockServer::new().await;
+        for version in [Some("123&456"), None] {
+            mock.push_fn(move |req| {
+                assert_eq!(req.method(), Method::DELETE);
+                let url = url::Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
+                let expected: Vec<(String, String)> = version
+                    .into_iter()
+                    .map(|v| ("generation".into(), v.into()))
+                    .collect();
+                assert_eq!(url.query_pairs().into_owned().collect::<Vec<_>>(), expected);
+                http::Response::builder()
+                    .status(204)
+                    .body(String::new())
+                    .unwrap()
+            });
+        }
+        let store = test_store(&mock);
+        for version in [Some("123&456".to_string()), None] {
+            store
+                .delete_opts(&Path::from("marker"), DeleteOptions { version })
+                .await
+                .unwrap();
+        }
+        mock.shutdown().await;
     }
 }

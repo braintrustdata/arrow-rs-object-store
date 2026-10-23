@@ -20,7 +20,7 @@ use crate::azure::credential::*;
 use crate::azure::{AzureCredentialProvider, STORE};
 use crate::client::builder::HttpRequestBuilder;
 use crate::client::get::GetClient;
-use crate::client::header::{HeaderConfig, get_put_result};
+use crate::client::header::{HeaderConfig, get_etag, get_put_result};
 use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
 use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpRequest, HttpResponse};
@@ -36,6 +36,7 @@ use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_STANDARD_NO_PAD};
 use bytes::{Buf, Bytes};
 use chrono::{DateTime, Utc};
+use futures_util::{StreamExt, stream};
 use http::{
     HeaderName, Method,
     header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, IF_MATCH, IF_NONE_MATCH},
@@ -103,6 +104,9 @@ pub(crate) enum Error {
         code: String,
         reason: String,
     },
+
+    #[error("Deleting the current blob version requires deleting the base blob: {path}")]
+    DeleteCurrentVersion { path: String },
 
     #[error("Error performing list request: {}", source)]
     ListRequest {
@@ -467,6 +471,17 @@ async fn parse_blob_batch_delete_body(
 
         match (id, part_response.code) {
             (Some(_id), Some(code)) if (200..300).contains(&code) => {}
+            (Some(id), Some(403))
+                if part_response.headers.iter().any(|header| {
+                    header.name.eq_ignore_ascii_case("x-ms-error-code")
+                        && header.value == b"OperationNotAllowedOnRootBlob"
+                }) =>
+            {
+                results[id] = Err(Error::DeleteCurrentVersion {
+                    path: paths[id].to_string(),
+                }
+                .into());
+            }
             (Some(id), Some(404)) => {
                 results[id] = Err(crate::Error::NotFound {
                     path: paths[id].as_ref().to_string(),
@@ -633,13 +648,16 @@ impl AzureClient {
     fn build_bulk_delete_body(
         &self,
         boundary: &str,
-        paths: &[Path],
+        paths: &[(Path, crate::DeleteOptions)],
         credential: &Option<Arc<AzureCredential>>,
     ) -> Vec<u8> {
         let mut body_bytes = Vec::with_capacity(paths.len() * 2048);
 
-        for (idx, path) in paths.iter().enumerate() {
-            let url = self.config.path_url(path);
+        for (idx, (path, options)) in paths.iter().enumerate() {
+            let mut url = self.config.path_url(path);
+            if let Some(version) = &options.version {
+                url.query_pairs_mut().append_pair("versionid", version);
+            }
 
             // Build subrequest with proper authorization
             let request = self
@@ -670,7 +688,71 @@ impl AzureClient {
         body_bytes
     }
 
-    pub(crate) async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
+    pub(crate) async fn bulk_delete_request(
+        &self,
+        paths: Vec<(Path, crate::DeleteOptions)>,
+    ) -> Result<Vec<Result<Path>>> {
+        let results = self.bulk_delete_request_once(&paths).await?;
+        Ok(stream::iter(paths.into_iter().zip(results))
+            .map(|((path, options), result)| async move {
+                let is_current_version = matches!(&result,
+                    Err(crate::Error::Generic { source, .. })
+                        if matches!(source.downcast_ref::<Error>(), Some(Error::DeleteCurrentVersion { .. })));
+                if is_current_version {
+                    if let Some(version) = options.version {
+                        return self.delete_current_version(&path, version).await.map(|()| path);
+                    }
+                }
+                result
+            })
+            .buffered(20)
+            .collect()
+            .await)
+    }
+
+    async fn delete_current_version(&self, path: &Path, version: String) -> Result<()> {
+        let options = GetOptions::new()
+            .with_version(Some(version.clone()))
+            .with_head(true);
+        let mut context = RetryContext::new(&self.config.retry_config);
+        let response = self.get_request(&mut context, path, options).await?;
+        let etag = get_etag(response.headers()).map_err(|source| Error::Metadata { source })?;
+        let credential = self.get_credential().await?;
+        let sensitive = credential
+            .as_deref()
+            .map(|c| c.sensitive_request())
+            .unwrap_or_default();
+        let result = self
+            .client
+            .delete(self.config.path_url(path).as_str())
+            .header(CONTENT_LENGTH, "0")
+            .header(IF_MATCH, etag)
+            .with_azure_authorization(&credential, &self.config.account)
+            .retryable(&self.config.retry_config)
+            .sensitive(sensitive)
+            .idempotent(true)
+            .send()
+            .await
+            .map_err(|error| error.error(STORE, path.to_string()));
+        match result {
+            Ok(_) | Err(crate::Error::Precondition { .. } | crate::Error::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        self.bulk_delete_request_once(&[(
+            path.clone(),
+            crate::DeleteOptions {
+                version: Some(version),
+            },
+        )])
+        .await?
+        .into_iter()
+        .try_for_each(|result| result.map(|_| ()))
+    }
+
+    async fn bulk_delete_request_once(
+        &self,
+        paths: &[(Path, crate::DeleteOptions)],
+    ) -> Result<Vec<Result<Path>>> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -681,7 +763,7 @@ impl AzureClient {
         let random_bytes = rand::random::<[u8; 16]>(); // 128 bits
         let boundary = format!("batch_{}", BASE64_STANDARD_NO_PAD.encode(random_bytes));
 
-        let body_bytes = self.build_bulk_delete_body(&boundary, &paths, &credential);
+        let body_bytes = self.build_bulk_delete_body(&boundary, paths, &credential);
 
         // Send multipart request
         let url = self.config.path_url(&Path::from("/"));
@@ -709,7 +791,15 @@ impl AzureClient {
             .await
             .map_err(|source| Error::BulkDeleteRequestBody { source })?;
 
-        let results = parse_blob_batch_delete_body(batch_body, boundary, &paths).await?;
+        let results = parse_blob_batch_delete_body(
+            batch_body,
+            boundary,
+            &paths
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await?;
 
         Ok(results)
     }
@@ -1196,6 +1286,176 @@ mod tests {
     use regex::bytes::Regex;
     use reqwest::Client;
 
+    fn delete_test_client(server: &MockServer) -> AzureClient {
+        let config = AzureConfig {
+            account: "testaccount".into(),
+            container: "testcontainer".into(),
+            credentials: Arc::new(StaticCredentialProvider::new(AzureCredential::BearerToken(
+                "test-token".into(),
+            ))),
+            service: server.url().parse().unwrap(),
+            retry_config: RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+            is_emulator: false,
+            skip_signature: false,
+            disable_tagging: false,
+            client_options: ClientOptions::new().with_allow_http(true),
+        };
+        AzureClient::new(config, HttpClient::new(Client::new()))
+    }
+
+    fn delete_batch_response(status: u16, error_code: &str) -> Response<String> {
+        let body = format!(
+            "--response\r\nContent-Type: application/http\r\nContent-ID: 0\r\n\r\nHTTP/1.1 {status} Result\r\nx-ms-error-code: {error_code}\r\nContent-Length: 0\r\n\r\n\r\n--response--\r\n"
+        );
+        Response::builder()
+            .status(202)
+            .header(CONTENT_TYPE, "multipart/mixed; boundary=response")
+            .body(body)
+            .unwrap()
+    }
+
+    async fn assert_version_delete_batch(req: hyper::Request<hyper::body::Incoming>) {
+        use http_body_util::BodyExt;
+        assert_eq!(req.method(), Method::POST);
+        let body = req.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("DELETE /testcontainer/marker?versionid=observed HTTP/1.1"));
+        assert!(!body.contains("DELETE /testcontainer/marker HTTP/1.1"));
+    }
+
+    async fn assert_current_version_delete(base_status: u16) {
+        let server = MockServer::new().await;
+        server.push_async_fn(|req| async {
+            assert_version_delete_batch(req).await;
+            delete_batch_response(403, "OperationNotAllowedOnRootBlob")
+        });
+        server.push_fn(|req| {
+            assert_eq!(req.method(), Method::HEAD);
+            assert_eq!(req.uri().path(), "/testcontainer/marker");
+            assert_eq!(req.uri().query(), Some("versionid=observed"));
+            Response::builder()
+                .status(200)
+                .header("etag", "\"observed-etag\"")
+                .body(String::new())
+                .unwrap()
+        });
+        server.push_fn(move |req| {
+            assert_eq!(req.method(), Method::DELETE);
+            assert_eq!(req.uri().path(), "/testcontainer/marker");
+            assert!(req.uri().query().is_none());
+            assert_eq!(req.headers().get(IF_MATCH).unwrap(), "\"observed-etag\"");
+            assert_eq!(
+                req.headers().get("authorization").unwrap(),
+                "Bearer test-token"
+            );
+            Response::builder()
+                .status(base_status)
+                .body(String::new())
+                .unwrap()
+        });
+        if [202, 412, 404].contains(&base_status) {
+            server.push_async_fn(|req| async {
+                assert_version_delete_batch(req).await;
+                delete_batch_response(202, "")
+            });
+        }
+        let client = delete_test_client(&server);
+        let results = client
+            .bulk_delete_request(vec![(
+                Path::from("marker"),
+                crate::DeleteOptions {
+                    version: Some("observed".into()),
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        if [202, 412, 404].contains(&base_status) {
+            assert_eq!(results[0].as_ref().unwrap(), &Path::from("marker"));
+        } else {
+            assert!(results[0].is_err());
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_current_version_delete_conditionally_removes_base() {
+        assert_current_version_delete(202).await;
+    }
+
+    #[tokio::test]
+    async fn test_current_version_delete_preserves_replacement_on_precondition_failure() {
+        assert_current_version_delete(412).await;
+    }
+
+    #[tokio::test]
+    async fn test_current_version_delete_handles_concurrent_base_deletion() {
+        assert_current_version_delete(404).await;
+    }
+
+    #[tokio::test]
+    async fn test_current_version_delete_propagates_base_permission_errors() {
+        assert_current_version_delete(403).await;
+    }
+
+    #[tokio::test]
+    async fn test_version_delete_does_not_retry_other_permission_errors() {
+        let server = MockServer::new().await;
+        server.push_async_fn(|req| async {
+            assert_version_delete_batch(req).await;
+            delete_batch_response(403, "AuthorizationPermissionMismatch")
+        });
+        let client = delete_test_client(&server);
+        let results = client
+            .bulk_delete_request(vec![(
+                Path::from("marker"),
+                crate::DeleteOptions {
+                    version: Some("observed".into()),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(results[0].is_err());
+        let Err(crate::Error::Generic { source, .. }) = &results[0] else {
+            panic!("expected deletion error")
+        };
+        assert!(
+            matches!(source.downcast_ref::<Error>(), Some(Error::DeleteFailed { code, .. }) if code == "403")
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_current_version_delete_requires_etag() {
+        let server = MockServer::new().await;
+        server.push(delete_batch_response(403, "OperationNotAllowedOnRootBlob"));
+        server.push_fn(|req| {
+            assert_eq!(req.method(), Method::HEAD);
+            Response::builder().status(200).body(String::new()).unwrap()
+        });
+        let client = delete_test_client(&server);
+        let results = client
+            .bulk_delete_request(vec![(
+                Path::from("marker"),
+                crate::DeleteOptions {
+                    version: Some("observed".into()),
+                },
+            )])
+            .await
+            .unwrap();
+        let Err(crate::Error::Generic { source, .. }) = &results[0] else {
+            panic!("expected missing ETag error")
+        };
+        assert!(matches!(
+            source.downcast_ref::<Error>(),
+            Some(Error::Metadata { .. })
+        ));
+        server.shutdown().await;
+    }
+
     #[test]
     fn deserde_azure() {
         const S: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
@@ -1408,9 +1668,36 @@ mod tests {
         let credential = client.get_credential().await.unwrap();
         let paths = &[Path::from("a"), Path::from("b"), Path::from("c")];
 
+        let versioned_body = client.build_bulk_delete_body(
+            "versioned",
+            &[
+                (
+                    Path::from("a"),
+                    crate::DeleteOptions {
+                        version: Some("2026-10-22T12:00:00.0000000Z".into()),
+                    },
+                ),
+                (Path::from("b"), crate::DeleteOptions::default()),
+            ],
+            &credential,
+        );
+        let versioned_body = String::from_utf8(versioned_body).unwrap();
+        assert!(versioned_body.contains(
+            "DELETE /testcontainer/a?versionid=2026-10-22T12%3A00%3A00.0000000Z HTTP/1.1"
+        ));
+        assert!(versioned_body.contains("DELETE /testcontainer/b HTTP/1.1"));
+
         let boundary = "batch_statictestboundary".to_string();
 
-        let body_bytes = client.build_bulk_delete_body(&boundary, paths, &credential);
+        let body_bytes = client.build_bulk_delete_body(
+            &boundary,
+            &paths
+                .iter()
+                .cloned()
+                .map(|path| (path, crate::DeleteOptions::default()))
+                .collect::<Vec<_>>(),
+            &credential,
+        );
 
         // Replace Date header value with a static date
         let re = Regex::new("Date:[^\r]+").unwrap();
