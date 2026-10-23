@@ -622,12 +622,13 @@ impl S3Client {
                         }),
                 );
             }
-            if !page.is_truncated {
+            if !page.is_truncated || page.next_key_marker.as_deref() != Some(path.as_ref()) {
                 break;
             }
             let next = (page.next_key_marker, page.next_version_id_marker);
             (key_marker, version_marker) = next;
         }
+        versions.sort_by_key(|entry| std::cmp::Reverse(entry.last_modified));
         Ok(versions)
     }
 
@@ -1332,6 +1333,34 @@ mod tests {
 
         assert!(result.is_ok());
         mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_versions_orders_versions_and_delete_markers() {
+        let mock = MockServer::new().await;
+        mock.push(Response::builder().status(200).body("<ListVersionsResult><IsTruncated>false</IsTruncated><DeleteMarker><Key>marker</Key><VersionId>new-delete</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-23T00:00:00Z</LastModified></DeleteMarker><Version><Key>marker</Key><VersionId>old-data</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-22T00:00:00Z</LastModified></Version></ListVersionsResult>".to_string()).unwrap());
+        let client = S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        );
+        let versions = client.list_versions(&Path::from("marker")).await.unwrap();
+        mock.shutdown().await;
+        assert_eq!(versions[0].version_id, "new-delete");
+    }
+
+    #[tokio::test]
+    async fn test_list_versions_stops_before_sibling_pages() {
+        let mock = MockServer::new().await;
+        mock.push(Response::builder().status(200).body("<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>marker-sibling</NextKeyMarker><NextVersionIdMarker>s1</NextVersionIdMarker><Version><Key>marker</Key><VersionId>v1</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T00:00:00Z</LastModified></Version><Version><Key>marker-sibling</Key><VersionId>s1</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T00:00:00Z</LastModified></Version></ListVersionsResult>".to_string()).unwrap());
+        mock.push(Response::builder().status(403).body(String::new()).unwrap());
+        let mut config = default_headers_config(&mock);
+        config.retry_config.max_retries = 0;
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+        let result = client.list_versions(&Path::from("marker")).await;
+        mock.shutdown().await;
+        let versions = result.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id, "v1");
     }
 
     #[tokio::test]
