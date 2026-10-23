@@ -633,13 +633,16 @@ impl AzureClient {
     fn build_bulk_delete_body(
         &self,
         boundary: &str,
-        paths: &[Path],
+        paths: &[(Path, crate::DeleteOptions)],
         credential: &Option<Arc<AzureCredential>>,
     ) -> Vec<u8> {
         let mut body_bytes = Vec::with_capacity(paths.len() * 2048);
 
-        for (idx, path) in paths.iter().enumerate() {
-            let url = self.config.path_url(path);
+        for (idx, (path, options)) in paths.iter().enumerate() {
+            let mut url = self.config.path_url(path);
+            if let Some(version) = &options.version {
+                url.query_pairs_mut().append_pair("versionid", version);
+            }
 
             // Build subrequest with proper authorization
             let request = self
@@ -670,7 +673,10 @@ impl AzureClient {
         body_bytes
     }
 
-    pub(crate) async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
+    pub(crate) async fn bulk_delete_request(
+        &self,
+        paths: Vec<(Path, crate::DeleteOptions)>,
+    ) -> Result<Vec<Result<Path>>> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -709,7 +715,12 @@ impl AzureClient {
             .await
             .map_err(|source| Error::BulkDeleteRequestBody { source })?;
 
-        let results = parse_blob_batch_delete_body(batch_body, boundary, &paths).await?;
+        let results = parse_blob_batch_delete_body(
+            batch_body,
+            boundary,
+            &paths.into_iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        )
+        .await?;
 
         Ok(results)
     }
@@ -1408,9 +1419,36 @@ mod tests {
         let credential = client.get_credential().await.unwrap();
         let paths = &[Path::from("a"), Path::from("b"), Path::from("c")];
 
+        let versioned_body = client.build_bulk_delete_body(
+            "versioned",
+            &[
+                (
+                    Path::from("a"),
+                    crate::DeleteOptions {
+                        version: Some("2026-10-22T12:00:00.0000000Z".into()),
+                    },
+                ),
+                (Path::from("b"), crate::DeleteOptions::default()),
+            ],
+            &credential,
+        );
+        let versioned_body = String::from_utf8(versioned_body).unwrap();
+        assert!(versioned_body.contains(
+            "DELETE /testcontainer/a?versionid=2026-10-22T12%3A00%3A00.0000000Z HTTP/1.1"
+        ));
+        assert!(versioned_body.contains("DELETE /testcontainer/b HTTP/1.1"));
+
         let boundary = "batch_statictestboundary".to_string();
 
-        let body_bytes = client.build_bulk_delete_body(&boundary, paths, &credential);
+        let body_bytes = client.build_bulk_delete_body(
+            &boundary,
+            &paths
+                .iter()
+                .cloned()
+                .map(|path| (path, crate::DeleteOptions::default()))
+                .collect::<Vec<_>>(),
+            &credential,
+        );
 
         // Replace Date header value with a static date
         let re = Regex::new("Date:[^\r]+").unwrap();

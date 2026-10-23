@@ -48,7 +48,6 @@ use http::header::{
     CONTENT_TYPE,
 };
 use http::{HeaderMap, HeaderName, Method};
-use itertools::Itertools;
 use md5::{Digest, Md5};
 use percent_encoding::{PercentEncode, utf8_percent_encode};
 use quick_xml::events::{self as xml_events};
@@ -178,6 +177,7 @@ struct DeletedObject {
 #[serde(rename_all = "PascalCase", rename = "Error")]
 struct DeleteError {
     key: String,
+    version_id: Option<String>,
     code: String,
     message: String,
 }
@@ -492,7 +492,10 @@ impl S3Client {
     /// there was an error for a certain path, the error will be returned in the
     /// vector. If there was an issue with making the overall request, an error
     /// will be returned at the top level.
-    pub(crate) async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
+    pub(crate) async fn bulk_delete_request(
+        &self,
+        paths: Vec<(Path, crate::DeleteOptions)>,
+    ) -> Result<Vec<Result<Path>>> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -508,7 +511,7 @@ impl S3Client {
                     .with_attributes([("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/")]),
             ))
             .unwrap();
-        for path in &paths {
+        for (path, options) in &paths {
             // <Object><Key>{path}</Key></Object>
             writer
                 .write_event(xml_events::Event::Start(xml_events::BytesStart::new(
@@ -529,6 +532,21 @@ impl S3Client {
             writer
                 .write_event(xml_events::Event::End(xml_events::BytesEnd::new("Key")))
                 .unwrap();
+            if let Some(version) = &options.version {
+                writer
+                    .write_event(xml_events::Event::Start(xml_events::BytesStart::new(
+                        "VersionId",
+                    )))
+                    .unwrap();
+                writer
+                    .write_event(xml_events::Event::Text(xml_events::BytesText::new(version)))
+                    .unwrap();
+                writer
+                    .write_event(xml_events::Event::End(xml_events::BytesEnd::new(
+                        "VersionId",
+                    )))
+                    .unwrap();
+            }
             writer
                 .write_event(xml_events::Event::End(xml_events::BytesEnd::new("Object")))
                 .unwrap();
@@ -563,7 +581,7 @@ impl S3Client {
             .await
             .map_err(|source| Error::DeleteObjectsRequest {
                 source,
-                paths: paths.iter().map(|p| p.to_string()).collect(),
+                paths: paths.iter().map(|(p, _)| p.to_string()).collect(),
             })?
             .into_body()
             .bytes()
@@ -579,14 +597,20 @@ impl S3Client {
 
         // Assume all were ok, then fill in errors. This guarantees output order
         // matches input order.
-        let mut results: Vec<Result<Path>> = paths.iter().cloned().map(Ok).collect();
+        let mut results: Vec<Result<Path>> =
+            paths.iter().map(|(path, _)| Ok(path.clone())).collect();
         for content in response.content.into_iter() {
             if let DeleteObjectResult::Error(error) = content {
                 let path =
                     Path::parse(&error.key).map_err(|err| Error::InvalidDeleteObjectsResponse {
                         source: Box::new(err),
                     })?;
-                let i = paths.iter().find_position(|&p| p == &path).unwrap().0;
+                let i = paths
+                    .iter()
+                    .position(|(p, options)| p == &path && options.version == error.version_id)
+                    .ok_or_else(|| Error::InvalidDeleteObjectsResponse {
+                        source: "Delete error did not match a requested key and version".into(),
+                    })?;
                 results[i] = Err(Error::from(error).into());
             }
         }
@@ -1165,6 +1189,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_versioned_delete_request_and_error_matching() {
+        use http_body_util::BodyExt;
+        let mock = MockServer::new().await;
+        mock.push_async_fn(|req| async move {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("<Key>same</Key><VersionId>v&amp;1</VersionId>"));
+            assert!(body.contains("<Key>same</Key><VersionId>v2</VersionId>"));
+            assert!(body.contains("<Object><Key>unversioned</Key></Object>"));
+            Response::builder().status(200).body(
+                "<DeleteResult><Deleted><Key>same</Key><VersionId>v&amp;1</VersionId></Deleted><Error><Key>same</Key><VersionId>v2</VersionId><Code>AccessDenied</Code><Message>denied</Message></Error></DeleteResult>".to_string()
+            ).unwrap()
+        });
+        let client = S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        );
+        let results = client
+            .bulk_delete_request(vec![
+                (
+                    Path::from("same"),
+                    crate::DeleteOptions {
+                        version: Some("v&1".into()),
+                    },
+                ),
+                (
+                    Path::from("same"),
+                    crate::DeleteOptions {
+                        version: Some("v2".into()),
+                    },
+                ),
+                (Path::from("unversioned"), crate::DeleteOptions::default()),
+            ])
+            .await
+            .unwrap();
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err());
+        assert!(results[2].is_ok());
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_default_headers_signed_bulk_delete() {
         let mock = MockServer::new().await;
         mock.push_fn(|req| {
@@ -1177,7 +1243,9 @@ mod tests {
 
         let config = default_headers_config(&mock);
         let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
-        let result = client.bulk_delete_request(vec![Path::from("test")]).await;
+        let result = client
+            .bulk_delete_request(vec![(Path::from("test"), crate::DeleteOptions::default())])
+            .await;
 
         assert!(result.is_ok());
         mock.shutdown().await;

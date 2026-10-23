@@ -146,6 +146,13 @@ impl ObjectStore for ChunkedStore {
         self.inner.delete_stream(locations)
     }
 
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        self.inner.delete_stream_opts(locations)
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner.list(prefix)
     }

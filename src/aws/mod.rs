@@ -267,6 +267,17 @@ impl ObjectStore for AmazonS3 {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        self.delete_stream_opts(
+            locations
+                .map_ok(|path| (path, crate::DeleteOptions::default()))
+                .boxed(),
+        )
+    }
+
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
         let client = Arc::clone(&self.client);
         locations
             .try_chunks(1_000)

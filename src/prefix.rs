@@ -140,6 +140,21 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
             .boxed()
     }
 
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let prefix = self.prefix.clone();
+        let locations = locations
+            .map(move |location| location.map(|(loc, options)| (full_path(&prefix, &loc), options)))
+            .boxed();
+        let prefix = self.prefix.clone();
+        self.inner
+            .delete_stream_opts(locations)
+            .map(move |location| location.map(|loc| strip_prefix(&prefix, loc)))
+            .boxed()
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let prefix = self.full_path(prefix.unwrap_or(&Path::default()));
         let s = self.inner.list(Some(&prefix));

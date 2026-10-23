@@ -48,6 +48,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use client::GoogleCloudStorageClient;
+use futures_util::TryStreamExt;
 use futures_util::stream::{BoxStream, StreamExt};
 use http::Method;
 use url::Url;
@@ -185,13 +186,24 @@ impl ObjectStore for GoogleCloudStorage {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        self.delete_stream_opts(
+            locations
+                .map_ok(|path| (path, crate::DeleteOptions::default()))
+                .boxed(),
+        )
+    }
+
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
         let client = Arc::clone(&self.client);
         locations
             .map(move |location| {
                 let client = Arc::clone(&client);
                 async move {
-                    let location = location?;
-                    client.delete_request(&location).await?;
+                    let (location, options) = location?;
+                    client.delete_request(&location, options).await?;
                     Ok(location)
                 }
             })

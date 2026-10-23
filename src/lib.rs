@@ -1068,6 +1068,39 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>>;
 
+    /// Delete objects with optional version IDs, preserving input order and native batching.
+    /// Stores without version support reject versioned targets instead of deleting the current object.
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, DeleteOptions)>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        self.delete_stream(
+            locations
+                .map(|entry| {
+                    let (path, options) = entry?;
+                    if options.version.is_some() {
+                        return Err(Error::NotSupported {
+                            source: "Versioned deletion is not supported by this store".into(),
+                        });
+                    }
+                    Ok(path)
+                })
+                .boxed(),
+        )
+    }
+
+    /// Delete a single object, optionally targeting a specific version.
+    async fn delete_opts(&self, location: &Path, options: DeleteOptions) -> Result<()> {
+        let entry = (location.clone(), options);
+        let mut stream =
+            self.delete_stream_opts(futures_util::stream::once(async move { Ok(entry) }).boxed());
+        stream.try_next().await?.ok_or_else(|| Error::Generic {
+            store: "delete_opts",
+            source: "delete_stream_opts did not return a result".into(),
+        })?;
+        Ok(())
+    }
+
     /// List all the objects with the given prefix.
     ///
     /// Prefixes are evaluated on a path segment basis, i.e. `foo/bar` is a prefix of `foo/bar/x` but not of
@@ -1172,6 +1205,13 @@ macro_rules! as_ref_impl {
                 locations: BoxStream<'static, Result<Path>>,
             ) -> BoxStream<'static, Result<Path>> {
                 self.as_ref().delete_stream(locations)
+            }
+
+            fn delete_stream_opts(
+                &self,
+                locations: BoxStream<'static, Result<(Path, DeleteOptions)>>,
+            ) -> BoxStream<'static, Result<Path>> {
+                self.as_ref().delete_stream_opts(locations)
             }
 
             fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -1413,6 +1453,13 @@ pub struct ListResult {
     pub common_prefixes: Vec<Path>,
     /// Object metadata for the listing
     pub objects: Vec<ObjectMeta>,
+}
+
+/// Options controlling which object version is deleted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeleteOptions {
+    /// The version to delete. `None` preserves the provider's ordinary delete behavior.
+    pub version: Option<String>,
 }
 
 /// The metadata that describes an object.
@@ -2153,6 +2200,69 @@ mod tests {
     use super::*;
 
     use chrono::TimeZone;
+
+    #[tokio::test]
+    async fn test_delete_opts_rejects_versions_on_unversioned_store() {
+        let store = memory::InMemory::new();
+        let path = Path::from("marker");
+        store.put(&path, "live".into()).await.unwrap();
+        assert!(matches!(
+            store
+                .delete_opts(
+                    &path,
+                    DeleteOptions {
+                        version: Some("v1".into())
+                    }
+                )
+                .await,
+            Err(Error::NotSupported { .. })
+        ));
+        assert!(store.head(&path).await.is_ok());
+        store
+            .delete_opts(&path, DeleteOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.head(&path).await,
+            Err(Error::NotFound { .. })
+        ));
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_versioned_delete_through_wrappers() {
+        use http_body_util::BodyExt;
+        let mock = client::mock_server::MockServer::new().await;
+        mock.push_async_fn(|req| async move {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8(body.to_vec()).unwrap().contains("<Key>prefix/marker</Key><VersionId>v1</VersionId>"));
+            ::http::Response::builder().status(200).body("<DeleteResult><Deleted><Key>prefix/marker</Key><VersionId>v1</VersionId></Deleted></DeleteResult>".to_string()).unwrap()
+        });
+        let s3 = aws::AmazonS3Builder::new()
+            .with_bucket_name("test")
+            .with_region("us-east-1")
+            .with_endpoint(mock.url())
+            .with_allow_http(true)
+            .with_skip_signature(true)
+            .build()
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(s3);
+        let store = prefix::PrefixStore::new(store, "prefix");
+        let store = limit::LimitStore::new(store, 1);
+        let store = throttle::ThrottledStore::new(store, Default::default());
+        let store = chunked::ChunkedStore::new(Arc::new(store), 10);
+        let store: Box<dyn ObjectStore> = Box::new(store);
+        store
+            .delete_opts(
+                &Path::from("marker"),
+                DeleteOptions {
+                    version: Some("v1".into()),
+                },
+            )
+            .await
+            .unwrap();
+        mock.shutdown().await;
+    }
 
     macro_rules! maybe_skip_integration {
         () => {
