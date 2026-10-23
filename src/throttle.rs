@@ -209,6 +209,11 @@ impl<T: ObjectStore> ObjectStore for ThrottledStore<T> {
         self.inner.delete_stream(locations)
     }
 
+    async fn delete_opts(&self, location: &Path, options: crate::DeleteOptions) -> Result<()> {
+        sleep(self.config().wait_delete_per_call).await;
+        self.inner.delete_opts(location, options).await
+    }
+
     async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
         sleep(self.config().wait_list_per_call).await;
         self.inner.list_versions(location).await

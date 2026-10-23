@@ -119,6 +119,11 @@ impl<T: ObjectStore> ObjectStore for LimitStore<T> {
         fut.into_stream().flatten().boxed()
     }
 
+    async fn delete_opts(&self, location: &Path, options: crate::DeleteOptions) -> Result<()> {
+        let _permit = self.semaphore.acquire().await.unwrap();
+        self.inner.delete_opts(location, options).await
+    }
+
     async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
         let _permit = self.semaphore.acquire().await.unwrap();
         self.inner.list_versions(location).await

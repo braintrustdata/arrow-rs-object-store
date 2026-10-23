@@ -1222,6 +1222,10 @@ macro_rules! as_ref_impl {
                 self.as_ref().delete_stream_opts(locations)
             }
 
+            async fn delete_opts(&self, location: &Path, options: DeleteOptions) -> Result<()> {
+                self.as_ref().delete_opts(location, options).await
+            }
+
             async fn list_versions(&self, location: &Path) -> Result<Vec<ObjectVersion>> {
                 self.as_ref().list_versions(location).await
             }
