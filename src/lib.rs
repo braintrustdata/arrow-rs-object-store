@@ -1075,12 +1075,21 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         self.list(prefix)
     }
 
-    /// List all versions and delete markers of one exact key, newest versions first.
+    /// Stream all versions and delete markers of one exact key, one page at a time.
+    /// Data versions are newest first; delete markers may be interleaved between pages.
     /// Currently supported by S3. Other stores return `NotSupported`.
-    async fn list_versions(&self, _location: &Path) -> Result<Vec<ObjectVersion>> {
-        Err(Error::NotSupported {
-            source: "Listing object versions is not supported by this store".into(),
+    fn list_versions_stream(&self, _location: &Path) -> BoxStream<'static, Result<ObjectVersion>> {
+        futures_util::stream::once(async {
+            Err(Error::NotSupported {
+                source: "Listing object versions is not supported by this store".into(),
+            })
         })
+        .boxed()
+    }
+
+    /// Collect the entire version history in memory. Prefer `list_versions_stream` for large histories.
+    async fn list_versions(&self, location: &Path) -> Result<Vec<ObjectVersion>> {
+        self.list_versions_stream(location).try_collect().await
     }
 
     /// Delete objects with optional version IDs, preserving input order and native batching.
@@ -1231,6 +1240,13 @@ macro_rules! as_ref_impl {
 
             async fn delete_opts(&self, location: &Path, options: DeleteOptions) -> Result<()> {
                 self.as_ref().delete_opts(location, options).await
+            }
+
+            fn list_versions_stream(
+                &self,
+                location: &Path,
+            ) -> BoxStream<'static, Result<ObjectVersion>> {
+                self.as_ref().list_versions_stream(location)
             }
 
             async fn list_versions(&self, location: &Path) -> Result<Vec<ObjectVersion>> {
@@ -1503,6 +1519,9 @@ pub struct ObjectVersion {
 pub struct DeleteOptions {
     /// The version to delete. `None` preserves the provider's ordinary delete behavior.
     pub version: Option<String>,
+    /// The ETag of the supplied version, used by Azure to optimize current-version deletion.
+    /// This is an optimization hint, not a delete precondition. Ignored without a version or by other stores.
+    pub e_tag: Option<String>,
 }
 
 /// The metadata that describes an object.
@@ -2254,7 +2273,8 @@ mod tests {
                 .delete_opts(
                     &path,
                     DeleteOptions {
-                        version: Some("v1".into())
+                        version: Some("v1".into()),
+                        ..Default::default()
                     }
                 )
                 .await,
@@ -2300,6 +2320,7 @@ mod tests {
                 &Path::from("marker"),
                 DeleteOptions {
                     version: Some("v1".into()),
+                    ..Default::default()
                 },
             )
             .await
@@ -2321,7 +2342,8 @@ mod tests {
         });
         assert!(
             store
-                .list_versions(&Path::from("marker"))
+                .list_versions_stream(&Path::from("marker"))
+                .try_collect::<Vec<_>>()
                 .await
                 .unwrap()
                 .is_empty()
@@ -2397,6 +2419,7 @@ mod tests {
                 meta.location,
                 DeleteOptions {
                     version: meta.version,
+                    ..Default::default()
                 },
             ))
         }))

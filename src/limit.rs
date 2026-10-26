@@ -135,6 +135,20 @@ impl<T: ObjectStore> ObjectStore for LimitStore<T> {
         self.inner.delete_opts(location, options).await
     }
 
+    fn list_versions_stream(
+        &self,
+        location: &Path,
+    ) -> BoxStream<'static, Result<crate::ObjectVersion>> {
+        let location = location.clone();
+        let inner = Arc::clone(&self.inner);
+        let fut = Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .map(move |permit| {
+                PermitWrapper::new(inner.list_versions_stream(&location), permit.unwrap())
+            });
+        fut.into_stream().flatten().boxed()
+    }
+
     async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
         let _permit = self.semaphore.acquire().await.unwrap();
         self.inner.list_versions(location).await

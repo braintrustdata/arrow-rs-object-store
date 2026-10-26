@@ -150,6 +150,13 @@ impl ObjectStore for ChunkedStore {
         self.inner.delete_opts(location, options).await
     }
 
+    fn list_versions_stream(
+        &self,
+        location: &Path,
+    ) -> BoxStream<'static, Result<crate::ObjectVersion>> {
+        self.inner.list_versions_stream(location)
+    }
+
     async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
         self.inner.list_versions(location).await
     }

@@ -157,6 +157,13 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
             .await
     }
 
+    fn list_versions_stream(
+        &self,
+        location: &Path,
+    ) -> BoxStream<'static, Result<crate::ObjectVersion>> {
+        self.inner.list_versions_stream(&self.full_path(location))
+    }
+
     async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
         self.inner.list_versions(&self.full_path(location)).await
     }

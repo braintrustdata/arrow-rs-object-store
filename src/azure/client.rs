@@ -482,6 +482,17 @@ async fn parse_blob_batch_delete_body(
                 }
                 .into());
             }
+            (Some(id), Some(412)) => {
+                results[id] = Err(crate::Error::Precondition {
+                    path: paths[id].to_string(),
+                    source: Error::DeleteFailed {
+                        path: paths[id].to_string(),
+                        code: "412".into(),
+                        reason: part_response.reason.unwrap_or_default().to_string(),
+                    }
+                    .into(),
+                });
+            }
             (Some(id), Some(404)) => {
                 results[id] = Err(crate::Error::NotFound {
                     path: paths[id].as_ref().to_string(),
@@ -650,20 +661,42 @@ impl AzureClient {
         boundary: &str,
         paths: &[(Path, crate::DeleteOptions)],
         credential: &Option<Arc<AzureCredential>>,
-    ) -> Vec<u8> {
+        prefer_current: bool,
+    ) -> Result<Vec<u8>> {
         let mut body_bytes = Vec::with_capacity(paths.len() * 2048);
 
         for (idx, (path, options)) in paths.iter().enumerate() {
             let mut url = self.config.path_url(path);
-            if let Some(version) = &options.version {
-                url.query_pairs_mut().append_pair("versionid", version);
+            let etag = prefer_current
+                .then_some(options)
+                .filter(|options| options.version.is_some())
+                .and_then(|options| options.e_tag.as_ref());
+            if etag.is_none() {
+                if let Some(version) = &options.version {
+                    url.query_pairs_mut().append_pair("versionid", version);
+                }
+            }
+            let mut builder = self
+                .client
+                .delete(url.as_str())
+                .header(CONTENT_LENGTH, HeaderValue::from(0));
+            if let Some(etag) = etag {
+                if etag == "*" {
+                    return Err(crate::Error::Generic {
+                        store: STORE,
+                        source: "Azure version deletion requires an exact ETag".into(),
+                    });
+                }
+                let value =
+                    HeaderValue::from_str(etag).map_err(|source| crate::Error::Generic {
+                        store: STORE,
+                        source: source.into(),
+                    })?;
+                builder = builder.header(IF_MATCH, value);
             }
 
             // Build subrequest with proper authorization
-            let request = self
-                .client
-                .delete(url.as_str())
-                .header(CONTENT_LENGTH, HeaderValue::from(0))
+            let request = builder
                 // Each subrequest must be authorized individually [1] and we use
                 // the CredentialExt for this.
                 // [1]: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch?tabs=microsoft-entra-id#request-body
@@ -685,29 +718,46 @@ impl AzureClient {
         extend(&mut body_bytes, boundary.as_bytes());
         extend(&mut body_bytes, b"--");
         extend(&mut body_bytes, b"\r\n");
-        body_bytes
+        Ok(body_bytes)
     }
 
     pub(crate) async fn bulk_delete_request(
         &self,
         paths: Vec<(Path, crate::DeleteOptions)>,
     ) -> Result<Vec<Result<Path>>> {
-        let results = self.bulk_delete_request_once(&paths).await?;
-        Ok(stream::iter(paths.into_iter().zip(results))
+        let results = self.bulk_delete_request_once(&paths, true).await?;
+        let mut retry_indices = Vec::new();
+        let mut retry_paths = Vec::new();
+        for (index, ((path, options), result)) in paths.iter().zip(&results).enumerate() {
+            if options.version.is_some()
+                && options.e_tag.is_some()
+                && matches!(
+                    result,
+                    Ok(_) | Err(crate::Error::Precondition { .. } | crate::Error::NotFound { .. })
+                )
+            {
+                retry_indices.push(index);
+                retry_paths.push((path.clone(), options.clone()));
+            }
+        }
+        let fallback = stream::iter(paths.into_iter().zip(results))
             .map(|((path, options), result)| async move {
                 let is_current_version = matches!(&result,
                     Err(crate::Error::Generic { source, .. })
                         if matches!(source.downcast_ref::<Error>(), Some(Error::DeleteCurrentVersion { .. })));
-                if is_current_version {
+                if is_current_version && options.e_tag.is_none() {
                     if let Some(version) = options.version {
                         return self.delete_current_version(&path, version).await.map(|()| path);
                     }
                 }
                 result
-            })
-            .buffered(20)
-            .collect()
-            .await)
+            }).buffered(20).collect::<Vec<_>>();
+        let (mut results, retries) =
+            futures_util::join!(fallback, self.bulk_delete_request_once(&retry_paths, false));
+        for (index, result) in retry_indices.into_iter().zip(retries?) {
+            results[index] = result;
+        }
+        Ok(results)
     }
 
     async fn delete_current_version(&self, path: &Path, version: String) -> Result<()> {
@@ -738,12 +788,16 @@ impl AzureClient {
             Ok(_) | Err(crate::Error::Precondition { .. } | crate::Error::NotFound { .. }) => {}
             Err(error) => return Err(error),
         }
-        self.bulk_delete_request_once(&[(
-            path.clone(),
-            crate::DeleteOptions {
-                version: Some(version),
-            },
-        )])
+        self.bulk_delete_request_once(
+            &[(
+                path.clone(),
+                crate::DeleteOptions {
+                    version: Some(version),
+                    ..Default::default()
+                },
+            )],
+            false,
+        )
         .await?
         .into_iter()
         .try_for_each(|result| result.map(|_| ()))
@@ -752,6 +806,7 @@ impl AzureClient {
     async fn bulk_delete_request_once(
         &self,
         paths: &[(Path, crate::DeleteOptions)],
+        prefer_current: bool,
     ) -> Result<Vec<Result<Path>>> {
         if paths.is_empty() {
             return Ok(Vec::new());
@@ -763,7 +818,8 @@ impl AzureClient {
         let random_bytes = rand::random::<[u8; 16]>(); // 128 bits
         let boundary = format!("batch_{}", BASE64_STANDARD_NO_PAD.encode(random_bytes));
 
-        let body_bytes = self.build_bulk_delete_body(&boundary, paths, &credential);
+        let body_bytes =
+            self.build_bulk_delete_body(&boundary, paths, &credential, prefer_current)?;
 
         // Send multipart request
         let url = self.config.path_url(&Path::from("/"));
@@ -1368,6 +1424,7 @@ mod tests {
                 Path::from("marker"),
                 crate::DeleteOptions {
                     version: Some("observed".into()),
+                    ..Default::default()
                 },
             )])
             .await
@@ -1402,6 +1459,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_etag_hint_batches_current_stale_and_failed_deletes_without_head() {
+        use http_body_util::BodyExt;
+        let server = MockServer::new().await;
+        server.push_async_fn(|req| async {
+            assert_eq!(req.method(), Method::POST);
+            let body = String::from_utf8(req.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+            assert!(body.contains("DELETE /testcontainer/current HTTP/1.1"));
+            assert!(body.contains("DELETE /testcontainer/stale HTTP/1.1"));
+            assert!(body.contains("DELETE /testcontainer/old?versionid=v-old HTTP/1.1"));
+            assert!(body.to_ascii_lowercase().contains("if-match: \"etag-current\""));
+            assert!(body.to_ascii_lowercase().contains("if-match: \"etag-stale\""));
+            let mut response = String::new();
+            for (id, code) in [202, 202, 412, 403].into_iter().enumerate() {
+                response.push_str(&format!("--response\r\nContent-Type: application/http\r\nContent-ID: {id}\r\n\r\nHTTP/1.1 {code} Result\r\nContent-Length: 0\r\n\r\n\r\n"));
+            }
+            response.push_str("--response--\r\n");
+            Response::builder().status(202).header(CONTENT_TYPE, "multipart/mixed; boundary=response").body(response).unwrap()
+        });
+        server.push_async_fn(|req| async {
+            assert_eq!(req.method(), Method::POST);
+            let body = String::from_utf8(req.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+            assert!(body.contains("DELETE /testcontainer/current?versionid=v-current HTTP/1.1"));
+            assert!(body.contains("DELETE /testcontainer/stale?versionid=v-stale HTTP/1.1"));
+            assert!(!body.contains("testcontainer/failed"));
+            assert!(!body.to_ascii_lowercase().contains("if-match:"));
+            let mut response = String::new();
+            for id in 0..2 {
+                response.push_str(&format!("--response\r\nContent-Type: application/http\r\nContent-ID: {id}\r\n\r\nHTTP/1.1 202 Result\r\nContent-Length: 0\r\n\r\n\r\n"));
+            }
+            response.push_str("--response--\r\n");
+            Response::builder().status(202).header(CONTENT_TYPE, "multipart/mixed; boundary=response").body(response).unwrap()
+        });
+        let paths = ["current", "old", "stale", "failed"]
+            .into_iter()
+            .map(|name| {
+                (
+                    Path::from(name),
+                    crate::DeleteOptions {
+                        version: Some(format!("v-{name}")),
+                        e_tag: (name != "old").then(|| format!("\"etag-{name}\"")),
+                    },
+                )
+            })
+            .collect();
+        let results = delete_test_client(&server)
+            .bulk_delete_request(paths)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 4);
+        for (result, name) in results.iter().zip(["current", "old", "stale"]) {
+            assert_eq!(result.as_ref().unwrap(), &Path::from(name));
+        }
+        assert!(results[3].is_err());
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_etag_hint_handles_absent_base_and_rejects_invalid_header() {
+        let server = MockServer::new().await;
+        server.push(delete_batch_response(404, "BlobNotFound"));
+        server.push_async_fn(|req| async {
+            assert_version_delete_batch(req).await;
+            delete_batch_response(202, "")
+        });
+        let client = delete_test_client(&server);
+        let options = crate::DeleteOptions {
+            version: Some("observed".into()),
+            e_tag: Some("\"observed-etag\"".into()),
+        };
+        let results = client
+            .bulk_delete_request(vec![(Path::from("marker"), options)])
+            .await
+            .unwrap();
+        assert!(results[0].is_ok());
+        for etag in ["invalid\r\nheader", "*"] {
+            let options = crate::DeleteOptions {
+                version: Some("observed".into()),
+                e_tag: Some(etag.into()),
+            };
+            assert!(
+                client
+                    .bulk_delete_request(vec![(Path::from("marker"), options)])
+                    .await
+                    .is_err()
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_version_delete_does_not_retry_other_permission_errors() {
         let server = MockServer::new().await;
         server.push_async_fn(|req| async {
@@ -1414,6 +1561,7 @@ mod tests {
                 Path::from("marker"),
                 crate::DeleteOptions {
                     version: Some("observed".into()),
+                    ..Default::default()
                 },
             )])
             .await
@@ -1442,6 +1590,7 @@ mod tests {
                 Path::from("marker"),
                 crate::DeleteOptions {
                     version: Some("observed".into()),
+                    ..Default::default()
                 },
             )])
             .await
@@ -1668,19 +1817,23 @@ mod tests {
         let credential = client.get_credential().await.unwrap();
         let paths = &[Path::from("a"), Path::from("b"), Path::from("c")];
 
-        let versioned_body = client.build_bulk_delete_body(
-            "versioned",
-            &[
-                (
-                    Path::from("a"),
-                    crate::DeleteOptions {
-                        version: Some("2026-10-22T12:00:00.0000000Z".into()),
-                    },
-                ),
-                (Path::from("b"), crate::DeleteOptions::default()),
-            ],
-            &credential,
-        );
+        let versioned_body = client
+            .build_bulk_delete_body(
+                "versioned",
+                &[
+                    (
+                        Path::from("a"),
+                        crate::DeleteOptions {
+                            version: Some("2026-10-22T12:00:00.0000000Z".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (Path::from("b"), crate::DeleteOptions::default()),
+                ],
+                &credential,
+                false,
+            )
+            .unwrap();
         let versioned_body = String::from_utf8(versioned_body).unwrap();
         assert!(versioned_body.contains(
             "DELETE /testcontainer/a?versionid=2026-10-22T12%3A00%3A00.0000000Z HTTP/1.1"
@@ -1689,15 +1842,18 @@ mod tests {
 
         let boundary = "batch_statictestboundary".to_string();
 
-        let body_bytes = client.build_bulk_delete_body(
-            &boundary,
-            &paths
-                .iter()
-                .cloned()
-                .map(|path| (path, crate::DeleteOptions::default()))
-                .collect::<Vec<_>>(),
-            &credential,
-        );
+        let body_bytes = client
+            .build_bulk_delete_body(
+                &boundary,
+                &paths
+                    .iter()
+                    .cloned()
+                    .map(|path| (path, crate::DeleteOptions::default()))
+                    .collect::<Vec<_>>(),
+                &credential,
+                false,
+            )
+            .unwrap();
 
         // Replace Date header value with a static date
         let re = Regex::new("Date:[^\r]+").unwrap();

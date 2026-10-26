@@ -225,6 +225,21 @@ impl<T: ObjectStore> ObjectStore for ThrottledStore<T> {
         self.inner.delete_opts(location, options).await
     }
 
+    fn list_versions_stream(
+        &self,
+        location: &Path,
+    ) -> BoxStream<'static, Result<crate::ObjectVersion>> {
+        let stream = self.inner.list_versions_stream(location);
+        let config = Arc::clone(&self.config);
+        futures_util::stream::once(async move {
+            let config = *config.lock();
+            sleep(config.wait_list_per_call).await;
+            throttle_stream(stream, move |_| config.wait_list_per_entry)
+        })
+        .flatten()
+        .boxed()
+    }
+
     async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
         sleep(self.config().wait_list_per_call).await;
         self.inner.list_versions(location).await

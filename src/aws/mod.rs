@@ -263,8 +263,18 @@ impl ObjectStore for AmazonS3 {
         self.client.get_opts(location, options).await
     }
 
+    fn list_versions_stream(
+        &self,
+        location: &Path,
+    ) -> BoxStream<'static, Result<crate::ObjectVersion>> {
+        self.client.list_versions_stream(location)
+    }
+
     async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
-        self.client.list_versions(location).await
+        self.client
+            .list_versions_stream(location)
+            .try_collect()
+            .await
     }
 
     fn delete_stream(

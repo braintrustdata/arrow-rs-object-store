@@ -792,6 +792,7 @@ mod delete_tests {
                 &meta.location,
                 DeleteOptions {
                     version: meta.version,
+                    ..Default::default()
                 },
             )
             .await
@@ -820,7 +821,13 @@ mod delete_tests {
         let store = test_store(&mock);
         for version in [Some("123&456".to_string()), None] {
             store
-                .delete_opts(&Path::from("marker"), DeleteOptions { version })
+                .delete_opts(
+                    &Path::from("marker"),
+                    DeleteOptions {
+                        version,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
         }
