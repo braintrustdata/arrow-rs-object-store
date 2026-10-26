@@ -43,12 +43,12 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::{Buf, Bytes};
+use futures_util::{StreamExt, TryStreamExt, stream::BoxStream};
 use http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
     CONTENT_TYPE,
 };
 use http::{HeaderMap, HeaderName, Method};
-use itertools::Itertools;
 use md5::{Digest, Md5};
 use percent_encoding::{PercentEncode, utf8_percent_encode};
 use quick_xml::events::{self as xml_events};
@@ -178,6 +178,7 @@ struct DeletedObject {
 #[serde(rename_all = "PascalCase", rename = "Error")]
 struct DeleteError {
     key: String,
+    version_id: Option<String>,
     code: String,
     message: String,
 }
@@ -461,6 +462,31 @@ pub(crate) struct S3Client {
     pub client: HttpClient,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListVersionsResponse {
+    #[serde(default)]
+    version: Vec<ListVersion>,
+    #[serde(default)]
+    delete_marker: Vec<ListVersion>,
+    is_truncated: bool,
+    next_key_marker: Option<String>,
+    next_version_id_marker: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListVersion {
+    key: String,
+    version_id: String,
+    last_modified: chrono::DateTime<chrono::Utc>,
+    is_latest: bool,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    e_tag: Option<String>,
+}
+
 impl S3Client {
     pub(crate) fn new(config: S3Config, client: HttpClient) -> Self {
         Self { config, client }
@@ -485,6 +511,142 @@ impl S3Client {
         }
     }
 
+    async fn list_versions_page(
+        &self,
+        prefix: &str,
+        key_marker: Option<&String>,
+        version_marker: Option<&String>,
+    ) -> Result<ListVersionsResponse> {
+        let credential = self.config.get_session_credential().await?;
+        let mut query = vec![("versions", ""), ("prefix", prefix)];
+        if let Some(marker) = key_marker {
+            query.push(("key-marker", marker));
+        }
+        if let Some(marker) = version_marker {
+            query.push(("version-id-marker", marker));
+        }
+        let mut builder = self
+            .client
+            .request(Method::GET, &self.config.bucket_endpoint);
+        if let Some(headers) = self.config.client_options.get_default_headers() {
+            builder = builder.headers(headers.clone());
+        }
+        let response = builder
+            .query(&query)
+            .with_aws_sigv4(credential.authorizer(), None)
+            .send_retry(&self.config.retry_config)
+            .await
+            .map_err(|source| Error::ListRequest { source })?
+            .into_body()
+            .bytes()
+            .await
+            .map_err(|source| Error::ListResponseBody { source })?;
+        let page: ListVersionsResponse = quick_xml::de::from_reader(response.reader())
+            .map_err(|source| Error::InvalidListResponse { source })?;
+        if page.is_truncated
+            && (page.next_key_marker.is_none()
+                || (
+                    page.next_key_marker.as_ref(),
+                    page.next_version_id_marker.as_ref(),
+                ) == (key_marker, version_marker))
+        {
+            return Err(crate::Error::Generic {
+                store: STORE,
+                source: "Truncated version listing did not advance pagination markers".into(),
+            });
+        }
+        Ok(page)
+    }
+
+    fn version_pages(
+        self: &Arc<Self>,
+        prefix: String,
+        exact_key: bool,
+    ) -> BoxStream<'static, Result<ListVersionsResponse>> {
+        let client = Arc::clone(self);
+        futures_util::stream::try_unfold(Some((None, None)), move |state| {
+            let client = Arc::clone(&client);
+            let prefix = prefix.clone();
+            async move {
+                let Some((key, version)) = state else {
+                    return Ok::<_, crate::Error>(None);
+                };
+                let page = client
+                    .list_versions_page(&prefix, key.as_ref(), version.as_ref())
+                    .await?;
+                let next = (page.is_truncated
+                    && (!exact_key || page.next_key_marker.as_deref() == Some(prefix.as_str())))
+                .then(|| {
+                    (
+                        page.next_key_marker.clone(),
+                        page.next_version_id_marker.clone(),
+                    )
+                });
+                Ok(Some((page, next)))
+            }
+        })
+        .boxed()
+    }
+
+    pub(crate) fn list_with_versions(
+        self: &Arc<Self>,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<crate::ObjectMeta>> {
+        let prefix = prefix
+            .filter(|p| !p.as_ref().is_empty())
+            .map(|p| format!("{}/", p.as_ref()))
+            .unwrap_or_default();
+        self.version_pages(prefix, false)
+            .map_ok(|page| {
+                futures_util::stream::iter(
+                    page.version
+                        .into_iter()
+                        .filter(|entry| entry.is_latest)
+                        .map(|entry| {
+                            Ok(crate::ObjectMeta {
+                                location: Path::parse(entry.key)?,
+                                last_modified: entry.last_modified,
+                                size: entry.size,
+                                e_tag: entry.e_tag,
+                                version: Some(entry.version_id),
+                            })
+                        }),
+                )
+            })
+            .try_flatten()
+            .boxed()
+    }
+
+    pub(crate) fn list_versions_stream(
+        self: &Arc<Self>,
+        path: &Path,
+    ) -> BoxStream<'static, Result<crate::ObjectVersion>> {
+        let path = path.to_string();
+        self.version_pages(path.clone(), true)
+            .map_ok(move |page| {
+                let path = path.clone();
+                let mut entries: Vec<_> = [(page.version, false), (page.delete_marker, true)]
+                    .into_iter()
+                    .flat_map(|(entries, is_delete_marker)| {
+                        entries
+                            .into_iter()
+                            .map(move |entry| (entry, is_delete_marker))
+                    })
+                    .filter(move |(entry, _)| entry.key == path)
+                    .map(|(entry, is_delete_marker)| crate::ObjectVersion {
+                        version_id: entry.version_id,
+                        last_modified: entry.last_modified,
+                        is_latest: entry.is_latest,
+                        is_delete_marker,
+                    })
+                    .collect();
+                entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_modified));
+                futures_util::stream::iter(entries.into_iter().map(Ok))
+            })
+            .try_flatten()
+            .boxed()
+    }
+
     /// Make an S3 Delete Objects request <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html>
     ///
     /// Produces a vector of results, one for each path in the input vector. If
@@ -492,7 +654,10 @@ impl S3Client {
     /// there was an error for a certain path, the error will be returned in the
     /// vector. If there was an issue with making the overall request, an error
     /// will be returned at the top level.
-    pub(crate) async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
+    pub(crate) async fn bulk_delete_request(
+        &self,
+        paths: Vec<(Path, crate::DeleteOptions)>,
+    ) -> Result<Vec<Result<Path>>> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -508,7 +673,7 @@ impl S3Client {
                     .with_attributes([("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/")]),
             ))
             .unwrap();
-        for path in &paths {
+        for (path, options) in &paths {
             // <Object><Key>{path}</Key></Object>
             writer
                 .write_event(xml_events::Event::Start(xml_events::BytesStart::new(
@@ -529,6 +694,21 @@ impl S3Client {
             writer
                 .write_event(xml_events::Event::End(xml_events::BytesEnd::new("Key")))
                 .unwrap();
+            if let Some(version) = &options.version {
+                writer
+                    .write_event(xml_events::Event::Start(xml_events::BytesStart::new(
+                        "VersionId",
+                    )))
+                    .unwrap();
+                writer
+                    .write_event(xml_events::Event::Text(xml_events::BytesText::new(version)))
+                    .unwrap();
+                writer
+                    .write_event(xml_events::Event::End(xml_events::BytesEnd::new(
+                        "VersionId",
+                    )))
+                    .unwrap();
+            }
             writer
                 .write_event(xml_events::Event::End(xml_events::BytesEnd::new("Object")))
                 .unwrap();
@@ -563,7 +743,7 @@ impl S3Client {
             .await
             .map_err(|source| Error::DeleteObjectsRequest {
                 source,
-                paths: paths.iter().map(|p| p.to_string()).collect(),
+                paths: paths.iter().map(|(p, _)| p.to_string()).collect(),
             })?
             .into_body()
             .bytes()
@@ -579,14 +759,20 @@ impl S3Client {
 
         // Assume all were ok, then fill in errors. This guarantees output order
         // matches input order.
-        let mut results: Vec<Result<Path>> = paths.iter().cloned().map(Ok).collect();
+        let mut results: Vec<Result<Path>> =
+            paths.iter().map(|(path, _)| Ok(path.clone())).collect();
         for content in response.content.into_iter() {
             if let DeleteObjectResult::Error(error) = content {
                 let path =
                     Path::parse(&error.key).map_err(|err| Error::InvalidDeleteObjectsResponse {
                         source: Box::new(err),
                     })?;
-                let i = paths.iter().find_position(|&p| p == &path).unwrap().0;
+                let i = paths
+                    .iter()
+                    .position(|(p, options)| p == &path && options.version == error.version_id)
+                    .ok_or_else(|| Error::InvalidDeleteObjectsResponse {
+                        source: "Delete error did not match a requested key and version".into(),
+                    })?;
                 results[i] = Err(Error::from(error).into());
             }
         }
@@ -1165,6 +1351,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_versions_orders_versions_and_delete_markers() {
+        let mock = MockServer::new().await;
+        mock.push(Response::builder().status(200).body("<ListVersionsResult><IsTruncated>false</IsTruncated><DeleteMarker><Key>marker</Key><VersionId>new-delete</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-23T00:00:00Z</LastModified></DeleteMarker><Version><Key>marker</Key><VersionId>old-data</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-22T00:00:00Z</LastModified></Version></ListVersionsResult>".to_string()).unwrap());
+        let client = Arc::new(S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        ));
+        let versions = client
+            .list_versions_stream(&Path::from("marker"))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        mock.shutdown().await;
+        assert_eq!(versions[0].version_id, "new-delete");
+    }
+
+    #[tokio::test]
+    async fn test_list_versions_stops_before_sibling_pages() {
+        let mock = MockServer::new().await;
+        mock.push(Response::builder().status(200).body("<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>marker-sibling</NextKeyMarker><NextVersionIdMarker>s1</NextVersionIdMarker><Version><Key>marker</Key><VersionId>v1</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T00:00:00Z</LastModified></Version><Version><Key>marker-sibling</Key><VersionId>s1</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T00:00:00Z</LastModified></Version></ListVersionsResult>".to_string()).unwrap());
+        mock.push(Response::builder().status(403).body(String::new()).unwrap());
+        let mut config = default_headers_config(&mock);
+        config.retry_config.max_retries = 0;
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+        let result = Arc::new(client)
+            .list_versions_stream(&Path::from("marker"))
+            .try_collect::<Vec<_>>()
+            .await;
+        mock.shutdown().await;
+        let versions = result.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id, "v1");
+    }
+
+    #[tokio::test]
+    async fn test_list_versions_pagination_and_exact_key() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_default_headers_signed(&req);
+            assert!(req.uri().query().unwrap().contains("versions="));
+            assert!(!req.uri().query().unwrap().contains("key-marker"));
+            Response::builder().status(200).body("<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>marker</NextKeyMarker><NextVersionIdMarker>v&amp;1</NextVersionIdMarker><Version><Key>marker</Key><VersionId>v2</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T12:00:01Z</LastModified></Version><Version><Key>marker-sibling</Key><VersionId>ignored</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T12:00:00Z</LastModified></Version></ListVersionsResult>".to_string()).unwrap()
+        });
+        mock.push_fn(|req| {
+            let url = url::Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
+            let pairs: std::collections::HashMap<_,_> = url.query_pairs().into_owned().collect();
+            assert_eq!(pairs.get("key-marker").unwrap(), "marker");
+            assert_eq!(pairs.get("version-id-marker").unwrap(), "v&1");
+            Response::builder().status(200).body("<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>marker</Key><VersionId>v1</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-22T12:00:00Z</LastModified></Version><DeleteMarker><Key>marker</Key><VersionId>d1</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-22T12:00:00Z</LastModified></DeleteMarker></ListVersionsResult>".to_string()).unwrap()
+        });
+        let client = Arc::new(S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        ));
+        let versions = client
+            .list_versions_stream(&Path::from("marker"))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|entry| entry.version_id.as_str())
+                .collect::<Vec<_>>(),
+            ["v2", "v1", "d1"]
+        );
+        assert!(versions[0].is_latest);
+        assert!(!versions[1].is_delete_marker);
+        assert!(versions[2].is_delete_marker);
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_version_history_is_lazy_and_dropping_stream_stops_pagination() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mock = MockServer::new().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request_calls = Arc::clone(&calls);
+        mock.push_fn(move |_| {
+            request_calls.fetch_add(1, Ordering::SeqCst);
+            Response::builder().status(200).body("<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>marker</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker><Version><Key>marker</Key><VersionId>v2</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-22T12:00:01Z</LastModified></Version></ListVersionsResult>".to_string()).unwrap()
+        });
+        let client = Arc::new(S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        ));
+        let mut versions = client.list_versions_stream(&Path::from("marker"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(versions.try_next().await.unwrap().unwrap().version_id, "v2");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(versions);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        mock.push(Response::builder().status(403).body(String::new()).unwrap());
+        let mut versions = client.list_versions_stream(&Path::from("marker"));
+        assert!(versions.try_next().await.is_err());
+        assert!(versions.try_next().await.unwrap().is_none());
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_versions_rejects_missing_pagination_markers() {
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .status(200)
+                .body(
+                    "<ListVersionsResult><IsTruncated>true</IsTruncated></ListVersionsResult>"
+                        .to_string(),
+                )
+                .unwrap(),
+        );
+        let client = S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        );
+        assert!(
+            Arc::new(client)
+                .list_versions_stream(&Path::from("marker"))
+                .try_collect::<Vec<_>>()
+                .await
+                .is_err()
+        );
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_with_versions_rejects_nonadvancing_pagination() {
+        let mock = MockServer::new().await;
+        let page = "<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>marker</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker></ListVersionsResult>";
+        for _ in 0..2 {
+            mock.push(
+                Response::builder()
+                    .status(200)
+                    .body(page.to_string())
+                    .unwrap(),
+            );
+        }
+        let client = Arc::new(S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        ));
+        assert!(
+            client
+                .list_with_versions(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .is_err()
+        );
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_versioned_delete_request_and_error_matching() {
+        use http_body_util::BodyExt;
+        let mock = MockServer::new().await;
+        mock.push_async_fn(|req| async move {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("<Key>same</Key><VersionId>v&amp;1</VersionId>"));
+            assert!(body.contains("<Key>same</Key><VersionId>v2</VersionId>"));
+            assert!(body.contains("<Object><Key>unversioned</Key></Object>"));
+            Response::builder().status(200).body(
+                "<DeleteResult><Deleted><Key>same</Key><VersionId>v&amp;1</VersionId></Deleted><Error><Key>same</Key><VersionId>v2</VersionId><Code>AccessDenied</Code><Message>denied</Message></Error></DeleteResult>".to_string()
+            ).unwrap()
+        });
+        let client = S3Client::new(
+            default_headers_config(&mock),
+            HttpClient::new(reqwest::Client::new()),
+        );
+        let results = client
+            .bulk_delete_request(vec![
+                (
+                    Path::from("same"),
+                    crate::DeleteOptions {
+                        version: Some("v&1".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    Path::from("same"),
+                    crate::DeleteOptions {
+                        version: Some("v2".into()),
+                        ..Default::default()
+                    },
+                ),
+                (Path::from("unversioned"), crate::DeleteOptions::default()),
+            ])
+            .await
+            .unwrap();
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err());
+        assert!(results[2].is_ok());
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_default_headers_signed_bulk_delete() {
         let mock = MockServer::new().await;
         mock.push_fn(|req| {
@@ -1177,7 +1559,9 @@ mod tests {
 
         let config = default_headers_config(&mock);
         let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
-        let result = client.bulk_delete_request(vec![Path::from("test")]).await;
+        let result = client
+            .bulk_delete_request(vec![(Path::from("test"), crate::DeleteOptions::default())])
+            .await;
 
         assert!(result.is_ok());
         mock.shutdown().await;

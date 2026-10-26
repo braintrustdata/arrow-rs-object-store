@@ -263,9 +263,34 @@ impl ObjectStore for AmazonS3 {
         self.client.get_opts(location, options).await
     }
 
+    fn list_versions_stream(
+        &self,
+        location: &Path,
+    ) -> BoxStream<'static, Result<crate::ObjectVersion>> {
+        self.client.list_versions_stream(location)
+    }
+
+    async fn list_versions(&self, location: &Path) -> Result<Vec<crate::ObjectVersion>> {
+        self.client
+            .list_versions_stream(location)
+            .try_collect()
+            .await
+    }
+
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        self.delete_stream_opts(
+            locations
+                .map_ok(|path| (path, crate::DeleteOptions::default()))
+                .boxed(),
+        )
+    }
+
+    fn delete_stream_opts(
+        &self,
+        locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
     ) -> BoxStream<'static, Result<Path>> {
         let client = Arc::clone(&self.client);
         locations
@@ -285,6 +310,10 @@ impl ObjectStore for AmazonS3 {
             .buffered(20)
             .try_flatten()
             .boxed()
+    }
+
+    fn list_with_versions(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.client.list_with_versions(prefix)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
