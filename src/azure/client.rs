@@ -1247,7 +1247,7 @@ impl TryFrom<Blob> for ObjectMeta {
             last_modified: value.properties.last_modified,
             size: value.properties.content_length,
             e_tag: value.properties.e_tag,
-            version: None, // For consistency with S3 and GCP which don't include this
+            version: value.version_id,
         })
     }
 }
@@ -1605,6 +1605,66 @@ mod tests {
         server.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn test_listed_version_can_be_deleted_without_head() {
+        use crate::ObjectStore;
+        use futures_util::TryStreamExt;
+        use http_body_util::BodyExt;
+        let server = MockServer::new().await;
+        server.push_fn(|req| {
+            assert_eq!(req.method(), Method::GET);
+            let query: HashMap<_, _> = Url::parse(&format!("http://localhost{}", req.uri())).unwrap().query_pairs().into_owned().collect();
+            assert_eq!(query.get("comp").unwrap(), "list");
+            assert!(!query.contains_key("include"));
+            Response::builder().status(200).body(r#"<EnumerationResults><Blobs><Blob><Name>marker</Name><VersionId>observed</VersionId><IsCurrentVersion>true</IsCurrentVersion><Properties><Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified><Content-Length>8</Content-Length><Content-Type>text/plain</Content-Type><Etag>"observed-etag"</Etag></Properties></Blob></Blobs><NextMarker/></EnumerationResults>"#.to_string()).unwrap()
+        });
+        server.push_async_fn(|req| async {
+            assert_eq!(req.method(), Method::POST);
+            let body =
+                String::from_utf8(req.into_body().collect().await.unwrap().to_bytes().to_vec())
+                    .unwrap();
+            assert!(body.contains("DELETE /testcontainer/marker HTTP/1.1"));
+            assert!(
+                body.to_ascii_lowercase()
+                    .contains("if-match: \"observed-etag\"")
+            );
+            assert!(!body.contains("versionid="));
+            delete_batch_response(202, "")
+        });
+        server.push_async_fn(|req| async {
+            assert_version_delete_batch(req).await;
+            delete_batch_response(202, "")
+        });
+        let store = crate::azure::MicrosoftAzureBuilder::new()
+            .with_account("testaccount")
+            .with_container_name("testcontainer")
+            .with_bearer_token_authorization("test-token")
+            .with_endpoint(server.url().to_string())
+            .with_allow_http(true)
+            .build()
+            .unwrap();
+        let meta = store
+            .list_with_versions(None)
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.version.as_deref(), Some("observed"));
+        assert_eq!(meta.e_tag.as_deref(), Some("\"observed-etag\""));
+        assert_eq!(meta.last_modified.timestamp(), 1625136299);
+        store
+            .delete_opts(
+                &meta.location,
+                crate::DeleteOptions {
+                    version: meta.version,
+                    e_tag: meta.e_tag,
+                },
+            )
+            .await
+            .unwrap();
+        server.shutdown().await;
+    }
+
     #[test]
     fn deserde_azure() {
         const S: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
@@ -1685,8 +1745,10 @@ mod tests {
     <NextMarker />
 </EnumerationResults>";
 
-        let mut _list_blobs_response_internal: ListResultInternal =
-            quick_xml::de::from_str(S).unwrap();
+        let response: ListResultInternal = quick_xml::de::from_str(S).unwrap();
+        let listed = to_list_result(response, None).unwrap();
+        assert_eq!(listed.objects.len(), 3);
+        assert!(listed.objects.iter().all(|meta| meta.version.is_none()));
     }
 
     #[test]

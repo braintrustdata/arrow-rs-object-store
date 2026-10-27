@@ -464,6 +464,126 @@ mod tests {
         }
     }
 
+    #[ignore = "Requires a real Azure account with blob versioning enabled"]
+    #[tokio::test]
+    async fn azure_listed_version_delete_avoids_head() {
+        use crate::client::{
+            HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService,
+            ReqwestConnector,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountHeads(Arc<AtomicUsize>);
+        #[derive(Debug)]
+        struct CountedClient(HttpClient, Arc<AtomicUsize>);
+        impl HttpConnector for CountHeads {
+            fn connect(&self, options: &crate::ClientOptions) -> Result<HttpClient> {
+                Ok(HttpClient::new(CountedClient(
+                    ReqwestConnector::default().connect(options)?,
+                    Arc::clone(&self.0),
+                )))
+            }
+        }
+        #[async_trait]
+        impl HttpService for CountedClient {
+            async fn call(
+                &self,
+                request: HttpRequest,
+            ) -> std::result::Result<HttpResponse, HttpError> {
+                if request.method() == Method::HEAD {
+                    self.1.fetch_add(1, Ordering::Relaxed);
+                }
+                self.0.execute(request).await
+            }
+        }
+        let heads = Arc::new(AtomicUsize::new(0));
+        let store = MicrosoftAzureBuilder::from_env()
+            .with_http_connector(CountHeads(Arc::clone(&heads)))
+            .build()
+            .unwrap();
+        assert!(
+            !store.client.config().is_emulator,
+            "Azurite cannot validate blob versioning"
+        );
+        for replace in [false, true] {
+            let prefix = Path::from(format!(
+                "listed-version-delete-test-{:032x}",
+                rand::random::<u128>()
+            ));
+            let path = prefix.clone().join("marker");
+            let created = store.put(&path, "observed".into()).await.unwrap();
+            assert!(
+                created.version.is_some(),
+                "The test account must have blob versioning enabled"
+            );
+            let before = heads.load(Ordering::Relaxed);
+            let listed = store
+                .list_with_versions(Some(&prefix))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(listed.len(), 1);
+            let meta = listed.into_iter().next().unwrap();
+            assert_eq!(meta.location, path);
+            assert_eq!(meta.version, created.version);
+            assert_eq!(
+                meta.e_tag.as_deref().unwrap().trim_matches('"'),
+                created.e_tag.as_deref().unwrap().trim_matches('"')
+            );
+            let replacement = if replace {
+                Some(store.put(&path, "replacement".into()).await.unwrap())
+            } else {
+                None
+            };
+            store
+                .delete_opts(
+                    &path,
+                    crate::DeleteOptions {
+                        version: meta.version.clone(),
+                        e_tag: meta.e_tag,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                heads.load(Ordering::Relaxed),
+                before,
+                "LIST-to-DELETE must not issue HEAD"
+            );
+            assert!(matches!(
+                store
+                    .get_opts(&path, GetOptions::new().with_version(meta.version))
+                    .await,
+                Err(crate::Error::NotFound { .. })
+            ));
+            if let Some(replacement) = replacement {
+                assert_eq!(
+                    store.head(&path).await.unwrap().version,
+                    replacement.version
+                );
+                assert_eq!(
+                    store.get(&path).await.unwrap().bytes().await.unwrap(),
+                    Bytes::from_static(b"replacement")
+                );
+                store
+                    .delete_opts(
+                        &path,
+                        crate::DeleteOptions {
+                            version: replacement.version,
+                            e_tag: replacement.e_tag,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(
+                store.head(&path).await,
+                Err(crate::Error::NotFound { .. })
+            ));
+        }
+    }
+
     #[ignore = "Used for manual testing against a real storage account."]
     #[tokio::test]
     async fn test_user_delegation_key() {
