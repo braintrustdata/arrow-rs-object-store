@@ -90,7 +90,14 @@ enum Error {
         header: &'static str,
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
+
+    #[error("Bulk delete concurrency must be at least 1")]
+    ZeroBulkDeleteConcurrency,
 }
+
+// Limit concurrent DeleteObjects requests to reduce bursts during large deletes.
+// This is per stream, not a rate limit; separate streams can still run concurrently.
+const DEFAULT_BULK_DELETE_CONCURRENCY: usize = 1;
 
 impl From<Error> for crate::Error {
     fn from(source: Error) -> Self {
@@ -191,6 +198,8 @@ pub struct AmazonS3Builder {
     request_payer: ConfigValue<bool>,
     /// Grant the bucket owner full control over uploaded objects
     bucket_owner_full_control: bool,
+    /// Maximum DeleteObjects requests in flight per `delete_stream` call
+    bulk_delete_concurrency: Option<ConfigValue<usize>>,
     /// The [`HttpConnector`] to use
     http_connector: Option<Arc<dyn HttpConnector>>,
 }
@@ -445,6 +454,16 @@ pub enum AmazonS3ConfigKey {
     /// - `request_payer`
     RequestPayer,
 
+    /// Maximum DeleteObjects requests (up to 1,000 keys each) in flight per
+    /// [`delete_stream`](crate::ObjectStore::delete_stream) call. Defaults to 1.
+    ///
+    /// See [`AmazonS3Builder::with_bulk_delete_concurrency`] for details.
+    ///
+    /// Supported keys:
+    /// - `aws_bulk_delete_concurrency`
+    /// - `bulk_delete_concurrency`
+    BulkDeleteConcurrency,
+
     /// Client options
     Client(ClientConfigKey),
 
@@ -481,6 +500,7 @@ impl AsRef<str> for AmazonS3ConfigKey {
             Self::ConditionalPut => "aws_conditional_put",
             Self::DisableTagging => "aws_disable_tagging",
             Self::RequestPayer => "aws_request_payer",
+            Self::BulkDeleteConcurrency => "aws_bulk_delete_concurrency",
             Self::Client(opt) => opt.as_ref(),
             Self::Encryption(opt) => opt.as_ref(),
         }
@@ -528,6 +548,9 @@ impl FromStr for AmazonS3ConfigKey {
             "aws_conditional_put" | "conditional_put" => Ok(Self::ConditionalPut),
             "aws_disable_tagging" | "disable_tagging" => Ok(Self::DisableTagging),
             "aws_request_payer" | "request_payer" => Ok(Self::RequestPayer),
+            "aws_bulk_delete_concurrency" | "bulk_delete_concurrency" => {
+                Ok(Self::BulkDeleteConcurrency)
+            }
             // Backwards compatibility
             "aws_allow_http" => Ok(Self::Client(ClientConfigKey::AllowHttp)),
             "aws_server_side_encryption" | "server_side_encryption" => Ok(Self::Encryption(
@@ -577,6 +600,7 @@ impl AmazonS3Builder {
     /// * `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` -> <https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html>
     /// * `AWS_ALLOW_HTTP` -> set to "true" to permit HTTP connections without TLS
     /// * `AWS_REQUEST_PAYER` -> set to "true" to permit operations on requester-pays buckets.
+    /// * `AWS_BULK_DELETE_CONCURRENCY` -> DeleteObjects requests in flight per `delete_stream` call (default 1).
     ///
     /// # Example
     /// ```
@@ -683,6 +707,9 @@ impl AmazonS3Builder {
             AmazonS3ConfigKey::RequestPayer => {
                 self.request_payer = ConfigValue::Deferred(value.into())
             }
+            AmazonS3ConfigKey::BulkDeleteConcurrency => {
+                self.bulk_delete_concurrency = Some(ConfigValue::Deferred(value.into()))
+            }
             AmazonS3ConfigKey::Encryption(key) => match key {
                 S3EncryptionConfigKey::ServerSideEncryption => {
                     self.encryption_type = Some(ConfigValue::Deferred(value.into()))
@@ -750,6 +777,10 @@ impl AmazonS3Builder {
             AmazonS3ConfigKey::ConditionalPut => Some(self.conditional_put.to_string()),
             AmazonS3ConfigKey::DisableTagging => Some(self.disable_tagging.to_string()),
             AmazonS3ConfigKey::RequestPayer => Some(self.request_payer.to_string()),
+            AmazonS3ConfigKey::BulkDeleteConcurrency => self
+                .bulk_delete_concurrency
+                .as_ref()
+                .map(ToString::to_string),
             AmazonS3ConfigKey::Encryption(key) => match key {
                 S3EncryptionConfigKey::ServerSideEncryption => {
                     self.encryption_type.as_ref().map(ToString::to_string)
@@ -1074,6 +1105,18 @@ impl AmazonS3Builder {
         self
     }
 
+    /// Set the maximum number of DeleteObjects requests (up to 1,000 keys each) a single
+    /// [`delete_stream`](crate::ObjectStore::delete_stream) call keeps in flight. Must be at
+    /// least 1. Defaults to 1.
+    ///
+    /// S3 throttles deletes per prefix, so a large `delete_stream` with many requests in flight
+    /// against one prefix fails with `SlowDown`. Separate `delete_stream` calls are not limited
+    /// by this setting.
+    pub fn with_bulk_delete_concurrency(mut self, concurrency: usize) -> Self {
+        self.bulk_delete_concurrency = Some(ConfigValue::Parsed(concurrency));
+        self
+    }
+
     /// The [`HttpConnector`] to use
     ///
     /// On non-WASM32 platforms uses [`reqwest`] by default, on WASM32 platforms must be provided
@@ -1241,6 +1284,15 @@ impl AmazonS3Builder {
             S3EncryptionHeaders::default()
         };
 
+        let bulk_delete_concurrency = self
+            .bulk_delete_concurrency
+            .map(|val| val.get())
+            .transpose()?
+            .unwrap_or(DEFAULT_BULK_DELETE_CONCURRENCY);
+        if bulk_delete_concurrency == 0 {
+            return Err(Error::ZeroBulkDeleteConcurrency.into());
+        }
+
         let config = S3Config {
             region,
             bucket,
@@ -1258,6 +1310,7 @@ impl AmazonS3Builder {
             encryption_headers,
             request_payer: self.request_payer.get()?,
             bucket_owner_full_control: self.bucket_owner_full_control,
+            bulk_delete_concurrency,
         };
 
         let http_client = http.connect(&config.client_options)?;
@@ -1514,6 +1567,44 @@ mod tests {
             Checksum::SHA256
         );
         assert!(builder.unsigned_payload.get().unwrap());
+    }
+
+    #[test]
+    fn s3_test_bulk_delete_concurrency_config() {
+        let build = |builder: AmazonS3Builder| builder.with_bucket_name("bucket").build();
+
+        let s3 = build(AmazonS3Builder::new()).unwrap();
+        assert_eq!(s3.client.config.bulk_delete_concurrency, 1);
+
+        for key in ["aws_bulk_delete_concurrency", "bulk_delete_concurrency"] {
+            let builder = AmazonS3Builder::new().with_config(key.parse().unwrap(), "4");
+            assert_eq!(
+                builder
+                    .get_config_value(&AmazonS3ConfigKey::BulkDeleteConcurrency)
+                    .as_deref(),
+                Some("4")
+            );
+            assert_eq!(
+                build(builder)
+                    .unwrap()
+                    .client
+                    .config
+                    .bulk_delete_concurrency,
+                4
+            );
+        }
+
+        let s3 = build(AmazonS3Builder::new().with_bulk_delete_concurrency(3)).unwrap();
+        assert_eq!(s3.client.config.bulk_delete_concurrency, 3);
+
+        let err = build(AmazonS3Builder::new().with_bulk_delete_concurrency(0)).unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "{err}");
+
+        let err = build(
+            AmazonS3Builder::new().with_config(AmazonS3ConfigKey::BulkDeleteConcurrency, "many"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("as usize"), "{err}");
     }
 
     #[test]
