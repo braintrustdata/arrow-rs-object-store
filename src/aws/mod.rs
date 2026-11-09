@@ -293,6 +293,7 @@ impl ObjectStore for AmazonS3 {
         locations: BoxStream<'static, Result<(Path, crate::DeleteOptions)>>,
     ) -> BoxStream<'static, Result<Path>> {
         let client = Arc::clone(&self.client);
+        let concurrency = client.config.bulk_delete_concurrency;
         locations
             .try_chunks(1_000)
             .map(move |locations| {
@@ -307,7 +308,7 @@ impl ObjectStore for AmazonS3 {
                         .map(futures_util::stream::iter)
                 }
             })
-            .buffered(20)
+            .buffered(concurrency)
             .try_flatten()
             .boxed()
     }
@@ -956,5 +957,64 @@ mod tests {
         // shutdown the io runtime and thread
         shutdown_tx.send(()).ok();
         thread_handle.join().expect("runtime thread panicked");
+    }
+
+    async fn max_bulk_delete_requests_in_flight(builder: AmazonS3Builder, keys: usize) -> usize {
+        use crate::client::mock_server::MockServer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mock = MockServer::new().await;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        for _ in 0..keys.div_ceil(1_000) {
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            mock.push_async_fn(move |req| async move {
+                assert_eq!(req.method(), http::Method::POST);
+                assert_eq!(req.uri().query(), Some("delete"));
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                http::Response::new(
+                    "<DeleteResult><Deleted><Key>key-00000</Key></Deleted></DeleteResult>"
+                        .to_string(),
+                )
+            });
+        }
+
+        let store = builder
+            .with_endpoint(mock.url())
+            .with_bucket_name("bucket")
+            .with_allow_http(true)
+            .with_skip_signature(true)
+            .build()
+            .unwrap();
+        let paths: Vec<_> = (0..keys)
+            .map(|i| Path::from(format!("key-{i:05}")))
+            .collect();
+        let deleted: Vec<_> = store
+            .delete_stream(futures_util::stream::iter(paths.clone()).map(Ok).boxed())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(deleted, paths);
+
+        mock.shutdown().await;
+        max_in_flight.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn s3_bulk_delete_concurrency_limits_requests_in_flight() {
+        assert_eq!(
+            max_bulk_delete_requests_in_flight(AmazonS3Builder::new(), 2_500).await,
+            1
+        );
+        let max = max_bulk_delete_requests_in_flight(
+            AmazonS3Builder::new().with_bulk_delete_concurrency(2),
+            4_000,
+        )
+        .await;
+        assert_eq!(max, 2);
     }
 }
