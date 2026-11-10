@@ -15,36 +15,49 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::net::ToSocketAddrs;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::LookupIpStrategy;
 use rand::prelude::SliceRandom;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use tokio::task::JoinSet;
 
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Debug)]
-pub(crate) struct ShuffleResolver;
+#[derive(Debug, Default)]
+pub(crate) struct ShuffleResolver {
+    // Built on first lookup. `builder_tokio` must run inside a Tokio runtime,
+    // and reqwest may construct this resolver before one is installed.
+    resolver: Arc<OnceLock<TokioResolver>>,
+}
+
+impl ShuffleResolver {
+    fn resolver(slot: &OnceLock<TokioResolver>) -> Result<TokioResolver, DynErr> {
+        if let Some(resolver) = slot.get() {
+            return Ok(resolver.clone());
+        }
+        let mut builder = TokioResolver::builder_tokio()?;
+        builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+        let _ = slot.set(builder.build());
+        slot.get()
+            .cloned()
+            .ok_or_else(|| "Hickory resolver was not installed".into())
+    }
+}
 
 impl Resolve for ShuffleResolver {
     fn resolve(&self, name: Name) -> Resolving {
+        let slot = Arc::clone(&self.resolver);
         Box::pin(async move {
-            // use `JoinSet` to propagate cancelation to tasks that haven't started running yet.
-            let mut tasks = JoinSet::new();
-            tasks.spawn_blocking(move || {
-                let it = (name.as_str(), 0).to_socket_addrs()?;
-                let mut addrs = it.collect::<Vec<_>>();
-
-                addrs.shuffle(&mut rand::rng());
-
-                Ok(Box::new(addrs.into_iter()) as Addrs)
-            });
-
-            tasks
-                .join_next()
-                .await
-                .expect("spawned on task")
-                .map_err(|err| Box::new(err) as DynErr)?
+            let resolver = Self::resolver(&slot)?;
+            let lookup = resolver.lookup_ip(name.as_str()).await?;
+            let mut addrs = lookup
+                .iter()
+                .map(|ip| SocketAddr::new(ip, 0))
+                .collect::<Vec<_>>();
+            addrs.shuffle(&mut rand::rng());
+            Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
 }
