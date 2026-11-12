@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// A temporary authentication token with an associated expiry
 #[derive(Debug, Clone)]
 pub(crate) struct TemporaryToken<T> {
@@ -96,7 +98,12 @@ impl<T: Clone + Send + Sync + 'static> TokenCache<T> {
 
         let fetch = f();
         let refresh = async move {
-            let cached = fetch.await?;
+            let cached = tokio::time::timeout(TOKEN_REFRESH_TIMEOUT, fetch)
+                .await
+                .map_err(|source| crate::Error::Generic {
+                    store: "TokenCache",
+                    source: Box::new(source),
+                })??;
             let token = cached.token.clone();
             *guard = Some(CacheEntry {
                 token: cached,
@@ -236,6 +243,52 @@ mod test {
     #[tokio::test]
     async fn test_refresh_completes_after_request_is_dropped() {
         refresh_survives_suspended_request(true).await;
+    }
+
+    async fn refresh_timeout_releases_cache(drop_request: bool) {
+        let cache = TokenCache::<String>::default();
+        let (started, started_wait) = tokio::sync::oneshot::channel();
+        let (cancelled_wait, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let mut request = Box::pin(cache.get_or_insert_with(|| async move {
+            started.send(()).unwrap();
+            cancelled.await.unwrap();
+            Ok::<_, crate::Error>(create_token(None))
+        }));
+        assert!(request.as_mut().now_or_never().is_none());
+        started_wait.await.unwrap();
+        assert!(cache.cache.try_read().is_err());
+        let mut request = if drop_request {
+            drop(request);
+            None
+        } else {
+            Some(request)
+        };
+        tokio::time::advance(Duration::from_secs(121)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            cancelled_wait.is_closed(),
+            "timed-out fetch was not dropped"
+        );
+        assert!(cache.cache.try_read().unwrap().is_none());
+        if let Some(request) = request.as_mut() {
+            let err = request.await.unwrap_err();
+            assert!(err.to_string().contains("deadline has elapsed"));
+        }
+        let token = cache
+            .get_or_insert_with(|| async { Ok::<_, crate::Error>(create_token(None)) })
+            .await
+            .unwrap();
+        assert_eq!(token, "test_token");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_refresh_times_out_without_polling_request() {
+        refresh_timeout_releases_cache(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_refresh_times_out_after_request_is_dropped() {
+        refresh_timeout_releases_cache(true).await;
     }
 
     #[tokio::test]
