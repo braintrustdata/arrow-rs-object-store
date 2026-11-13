@@ -710,7 +710,12 @@ impl CredentialProvider for TaskCredentialProvider {
 
     async fn get_credential(&self) -> Result<Arc<AwsCredential>> {
         self.cache
-            .get_or_insert_with(|| task_credential(&self.client, &self.retry, &self.url))
+            .get_or_insert_with(|| {
+                let client = self.client.clone();
+                let retry = self.retry.clone();
+                let url = self.url.clone();
+                async move { task_credential(&client, &retry, &url).await }
+            })
             .await
             .map_err(|source| crate::Error::Generic {
                 store: STORE,
@@ -762,7 +767,11 @@ impl CredentialProvider for EKSPodCredentialProvider {
     async fn get_credential(&self) -> Result<Arc<AwsCredential>> {
         self.cache
             .get_or_insert_with(|| {
-                eks_credential(&self.client, &self.retry, &self.url, &self.token_file)
+                let client = self.client.clone();
+                let retry = self.retry.clone();
+                let url = self.url.clone();
+                let token_file = self.token_file.clone();
+                async move { eks_credential(&client, &retry, &url, &token_file).await }
             })
             .await
             .map_err(|source| crate::Error::Generic {

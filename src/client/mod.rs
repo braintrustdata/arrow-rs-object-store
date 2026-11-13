@@ -951,7 +951,7 @@ mod cloud {
     /// A [`CredentialProvider`] that uses [`HttpClient`] to fetch temporary tokens
     #[derive(Debug)]
     pub(crate) struct TokenCredentialProvider<T: TokenProvider> {
-        inner: T,
+        inner: Arc<T>,
         client: HttpClient,
         retry: RetryConfig,
         cache: TokenCache<Arc<T::Credential>>,
@@ -960,7 +960,7 @@ mod cloud {
     impl<T: TokenProvider> TokenCredentialProvider<T> {
         pub(crate) fn new(inner: T, client: HttpClient, retry: RetryConfig) -> Self {
             Self {
-                inner,
+                inner: Arc::new(inner),
                 client,
                 retry,
                 cache: Default::default(),
@@ -976,19 +976,24 @@ mod cloud {
     }
 
     #[async_trait]
-    impl<T: TokenProvider> CredentialProvider for TokenCredentialProvider<T> {
+    impl<T: TokenProvider + 'static> CredentialProvider for TokenCredentialProvider<T> {
         type Credential = T::Credential;
 
         async fn get_credential(&self) -> Result<Arc<Self::Credential>> {
             self.cache
-                .get_or_insert_with(|| self.inner.fetch_token(&self.client, &self.retry))
+                .get_or_insert_with(|| {
+                    let inner = Arc::clone(&self.inner);
+                    let client = self.client.clone();
+                    let retry = self.retry.clone();
+                    async move { inner.fetch_token(&client, &retry).await }
+                })
                 .await
         }
     }
 
     #[async_trait]
     pub(crate) trait TokenProvider: std::fmt::Debug + Send + Sync {
-        type Credential: std::fmt::Debug + Send + Sync;
+        type Credential: std::fmt::Debug + Send + Sync + 'static;
 
         async fn fetch_token(
             &self,
