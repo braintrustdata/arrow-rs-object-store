@@ -22,6 +22,39 @@ use tokio::sync::RwLock;
 
 const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn credential_runtime() -> crate::Result<&'static tokio::runtime::Handle> {
+    static RUNTIME: std::sync::OnceLock<std::io::Result<tokio::runtime::Handle>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            std::thread::Builder::new()
+                .name("object-store-credentials".into())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => {
+                            if send.send(Ok(runtime.handle().clone())).is_ok() {
+                                runtime.block_on(std::future::pending::<()>());
+                            }
+                        }
+                        Err(error) => {
+                            let _ = send.send(Err(error));
+                        }
+                    }
+                })?;
+            receive.recv().map_err(std::io::Error::other)?
+        })
+        .as_ref()
+        .map_err(|source| crate::Error::Generic {
+            store: "TokenCache",
+            source: Box::new(source),
+        })
+}
+
 /// A temporary authentication token with an associated expiry
 #[derive(Debug, Clone)]
 pub(crate) struct TemporaryToken<T> {
@@ -39,6 +72,7 @@ pub(crate) struct TokenCache<T> {
     cache: Arc<RwLock<Option<CacheEntry<T>>>>,
     min_ttl: Duration,
     fetch_backoff: Duration,
+    refresh_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -55,6 +89,7 @@ impl<T> Default for TokenCache<T> {
             // How long to wait before re-attempting a token fetch after receiving one that
             // is still within the min-ttl
             fetch_backoff: Duration::from_millis(100),
+            refresh_timeout: TOKEN_REFRESH_TIMEOUT,
         }
     }
 }
@@ -97,8 +132,9 @@ impl<T: Clone + Send + Sync + 'static> TokenCache<T> {
         }
 
         let fetch = f();
+        let refresh_timeout = self.refresh_timeout;
         let refresh = async move {
-            let cached = tokio::time::timeout(TOKEN_REFRESH_TIMEOUT, fetch)
+            let cached = tokio::time::timeout(refresh_timeout, fetch)
                 .await
                 .map_err(|source| crate::Error::Generic {
                     store: "TokenCache",
@@ -113,7 +149,10 @@ impl<T: Clone + Send + Sync + 'static> TokenCache<T> {
         };
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         {
-            tokio::spawn(refresh).await.map_err(crate::Error::from)?
+            credential_runtime()?
+                .spawn(refresh)
+                .await
+                .map_err(crate::Error::from)?
         }
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {
@@ -172,6 +211,7 @@ mod test {
             cache: Default::default(),
             min_ttl: Duration::from_secs(1),
             fetch_backoff: Duration::from_millis(1),
+            ..Default::default()
         };
 
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -246,9 +286,12 @@ mod test {
     }
 
     async fn refresh_timeout_releases_cache(drop_request: bool) {
-        let cache = TokenCache::<String>::default();
+        let cache = TokenCache::<String> {
+            refresh_timeout: Duration::from_millis(20),
+            ..Default::default()
+        };
         let (started, started_wait) = tokio::sync::oneshot::channel();
-        let (cancelled_wait, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let (mut cancelled_wait, cancelled) = tokio::sync::oneshot::channel::<()>();
         let mut request = Box::pin(cache.get_or_insert_with(|| async move {
             started.send(()).unwrap();
             cancelled.await.unwrap();
@@ -263,13 +306,9 @@ mod test {
         } else {
             Some(request)
         };
-        tokio::time::advance(Duration::from_secs(121)).await;
-        tokio::task::yield_now().await;
-        assert!(
-            cancelled_wait.is_closed(),
-            "timed-out fetch was not dropped"
-        );
-        assert!(cache.cache.try_read().unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(2), cancelled_wait.closed())
+            .await
+            .expect("timed-out fetch was not dropped");
         if let Some(request) = request.as_mut() {
             let err = request.await.unwrap_err();
             assert!(err.to_string().contains("deadline has elapsed"));
@@ -281,14 +320,55 @@ mod test {
         assert_eq!(token, "test_token");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn test_refresh_times_out_without_polling_request() {
         refresh_timeout_releases_cache(false).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn test_refresh_times_out_after_request_is_dropped() {
         refresh_timeout_releases_cache(true).await;
+    }
+
+    #[test]
+    fn test_refresh_without_callers_tokio_runtime() {
+        let cache = TokenCache::<String>::default();
+        let caller = std::thread::current().id();
+        let token = futures_executor::block_on(cache.get_or_insert_with(|| async move {
+            assert_ne!(std::thread::current().id(), caller);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Ok::<_, crate::Error>(create_token(None))
+        }))
+        .unwrap();
+        assert_eq!(token, "test_token");
+    }
+
+    #[test]
+    fn test_refresh_completes_when_callers_runtime_stops() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cache = TokenCache::<String>::default();
+        let (started, started_wait) = tokio::sync::oneshot::channel();
+        let (release, release_wait) = tokio::sync::oneshot::channel();
+        let (completed, completed_wait) = std::sync::mpsc::channel();
+        let mut request = Box::pin(cache.get_or_insert_with(|| async move {
+            started.send(()).unwrap();
+            release_wait.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            completed.send(()).unwrap();
+            Ok::<_, crate::Error>(create_token(None))
+        }));
+        runtime.block_on(async {
+            assert!(request.as_mut().now_or_never().is_none());
+            started_wait.await.unwrap();
+        });
+        release.send(()).unwrap();
+        completed_wait
+            .recv_timeout(Duration::from_secs(2))
+            .expect("credential refresh depends on the caller's stopped runtime");
+        assert_eq!(futures_executor::block_on(request).unwrap(), "test_token");
     }
 
     #[tokio::test]
