@@ -68,7 +68,7 @@ tracing = { version = "0.1", optional = true }
 # Hickory's tokio feature enables tokio/net, which does not build for wasm.
 # The shuffle resolver is already cfg'd out on wasm.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-hickory-resolver = { version = "0.25", features = ["tokio"], optional = true }
+hickory-resolver = { version = "0.25.2", optional = true }
 
 [target.'cfg(target_family="unix")'.dev-dependencies]
 nix = { version = "0.31.1", features = ["fs"] }
@@ -80,7 +80,7 @@ futures-channel = {version = "0.3", features = ["sink"]}
 
 [features]
 default = ["fs"]
-cloud = ["serde", "serde_json", "quick-xml", "hyper", "reqwest", "reqwest/stream", "hickory-resolver", "chrono/serde", "base64", "rand", "ring", "http-body-util", "form_urlencoded", "serde_urlencoded", "tokio"]
+cloud = ["serde", "serde_json", "quick-xml", "hyper", "reqwest", "reqwest/stream", "chrono/serde", "base64", "rand", "ring", "http-body-util", "form_urlencoded", "serde_urlencoded", "tokio", "dep:hickory-resolver"]
 azure = ["cloud", "httparse"]
 fs = ["walkdir", "tokio"]
 gcp = ["cloud", "rustls-pki-types"]
