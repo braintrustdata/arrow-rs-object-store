@@ -210,6 +210,7 @@ pub(crate) struct S3Config {
     pub conditional_put: S3ConditionalPut,
     pub request_payer: bool,
     pub bucket_owner_full_control: bool,
+    pub bulk_delete_concurrency: usize,
     pub(super) encryption_headers: S3EncryptionHeaders,
 }
 
@@ -1206,6 +1207,7 @@ mod tests {
             encryption_headers: Default::default(),
             request_payer: false,
             bucket_owner_full_control: Default::default(),
+            bulk_delete_concurrency: 1,
         };
 
         let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
@@ -1267,6 +1269,7 @@ mod tests {
             encryption_headers: Default::default(),
             request_payer: false,
             bucket_owner_full_control: true,
+            bulk_delete_concurrency: 1,
         };
 
         let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
@@ -1323,6 +1326,7 @@ mod tests {
             encryption_headers: Default::default(),
             request_payer: false,
             bucket_owner_full_control: Default::default(),
+            bulk_delete_concurrency: 1,
         }
     }
 
