@@ -877,7 +877,7 @@ impl AzureCliCredential {
     }
 
     /// Fetch a token
-    async fn fetch_token(&self) -> Result<TemporaryToken<Arc<AzureCredential>>> {
+    fn fetch_token() -> Result<TemporaryToken<Arc<AzureCredential>>> {
         // on window az is a cmd and it should be called like this
         // see https://doc.rust-lang.org/nightly/std/process/struct.Command.html
         let program = if cfg!(target_os = "windows") {
@@ -1058,7 +1058,16 @@ impl CredentialProvider for AzureCliCredential {
     type Credential = AzureCredential;
 
     async fn get_credential(&self) -> crate::Result<Arc<Self::Credential>> {
-        Ok(self.cache.get_or_insert_with(|| self.fetch_token()).await?)
+        Ok(self
+            .cache
+            .get_or_insert_with(|| async {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => runtime.spawn_blocking(Self::fetch_token).await?,
+                    Err(_) => Self::fetch_token(),
+                }
+                .map_err(crate::Error::from)
+            })
+            .await?)
     }
 }
 
