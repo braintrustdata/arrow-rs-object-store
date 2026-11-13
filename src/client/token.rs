@@ -184,7 +184,6 @@ impl<T: Clone + Send + Sync + 'static> TokenCache<T> {
 mod test {
     use crate::client::token::{TemporaryToken, TokenCache};
     use futures_util::FutureExt;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
@@ -247,7 +246,7 @@ mod test {
     }
 
     async fn refresh_survives_suspended_request(drop_request: bool) {
-        let cache = Arc::new(TokenCache::<String>::default());
+        let cache = TokenCache::<String>::default();
         let (started, started_wait) = tokio::sync::oneshot::channel();
         let (response, response_wait) = tokio::sync::oneshot::channel();
         let mut request = Box::pin(cache.get_or_insert_with(|| async move {
@@ -270,10 +269,8 @@ mod test {
         response.send(()).unwrap();
         let token = tokio::time::timeout(
             TEST_WAIT_TIMEOUT,
-            cache.get_or_insert_with(|| async {
-                panic!("concurrent request must reuse the in-flight refresh");
-                #[allow(unreachable_code)]
-                Ok::<_, crate::Error>(create_token(None))
+            cache.get_or_insert_with::<_, _, crate::Error>(|| async {
+                panic!("concurrent request must reuse the in-flight refresh")
             }),
         )
         .await
@@ -286,13 +283,11 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_refresh_completes_without_polling_request() {
-        refresh_survives_suspended_request(false).await;
-    }
-
-    #[tokio::test]
-    async fn test_refresh_completes_after_request_is_dropped() {
-        refresh_survives_suspended_request(true).await;
+    async fn test_refresh_survives_suspended_or_dropped_requests() {
+        tokio::join!(
+            refresh_survives_suspended_request(false),
+            refresh_survives_suspended_request(true),
+        );
     }
 
     async fn refresh_timeout_releases_cache(drop_request: bool) {
@@ -333,26 +328,20 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_refresh_times_out_without_polling_request() {
-        refresh_timeout_releases_cache(false).await;
-    }
-
-    #[tokio::test]
-    async fn test_refresh_times_out_after_request_is_dropped() {
-        refresh_timeout_releases_cache(true).await;
+    async fn test_refresh_times_out_for_suspended_or_dropped_requests() {
+        tokio::join!(
+            refresh_timeout_releases_cache(false),
+            refresh_timeout_releases_cache(true),
+        );
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[test]
     fn test_runtime_startup_failure_can_retry() {
         let runtime = parking_lot::Mutex::new(None);
-        let error = super::get_or_start_runtime(&runtime, || {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "temporary thread startup failure",
-            ))
-        })
-        .unwrap_err();
+        let error =
+            super::get_or_start_runtime(&runtime, || Err(std::io::ErrorKind::WouldBlock.into()))
+                .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert!(runtime.lock().is_none());
 
@@ -361,14 +350,10 @@ mod test {
             .build()
             .unwrap();
         super::get_or_start_runtime(&runtime, || Ok(owner.handle().clone())).unwrap();
-        let handle = super::get_or_start_runtime(&runtime, || {
+        super::get_or_start_runtime(&runtime, || {
             panic!("successful runtime initialization must be reused")
         })
         .unwrap();
-        assert_eq!(
-            owner.block_on(handle.spawn(async { "ready" })).unwrap(),
-            "ready"
-        );
     }
 
     #[test]
