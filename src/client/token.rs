@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use parking_lot::RwLock;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::watch;
 
 const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -81,10 +82,25 @@ pub(crate) struct TemporaryToken<T> {
 /// [`TemporaryToken`] based on its expiry
 #[derive(Debug)]
 pub(crate) struct TokenCache<T> {
-    cache: Arc<RwLock<Option<CacheEntry<T>>>>,
+    cache: Arc<RwLock<CacheState<T>>>,
     min_ttl: Duration,
     fetch_backoff: Duration,
     refresh_timeout: Duration,
+}
+
+#[derive(Debug)]
+struct CacheState<T> {
+    entry: Option<CacheEntry<T>>,
+    refreshing: Option<watch::Sender<()>>,
+}
+
+struct RefreshGuard<T>(Arc<RwLock<CacheState<T>>>);
+
+impl<T> Drop for RefreshGuard<T> {
+    fn drop(&mut self) {
+        let finished = self.0.write().refreshing.take();
+        drop(finished);
+    }
 }
 
 #[derive(Debug)]
@@ -96,7 +112,10 @@ struct CacheEntry<T> {
 impl<T> Default for TokenCache<T> {
     fn default() -> Self {
         Self {
-            cache: Default::default(),
+            cache: Arc::new(RwLock::new(CacheState {
+                entry: None,
+                refreshing: None,
+            })),
             min_ttl: Duration::from_secs(300),
             // How long to wait before re-attempting a token fetch after receiving one that
             // is still within the min-ttl
@@ -119,29 +138,34 @@ impl<T: Clone + Send + Sync + 'static> TokenCache<T> {
         Fut: Future<Output = Result<TemporaryToken<T>, E>> + Send + 'static,
         E: From<crate::Error> + Send + 'static,
     {
-        let now = Instant::now();
-        let is_token_valid = |entry: &CacheEntry<T>| {
-            entry.token.expiry.is_none_or(|ttl| {
-                ttl.checked_duration_since(now).unwrap_or_default() > self.min_ttl ||
-                // if we've recently attempted to fetch this token and it's not actually
-                // expired, we'll wait to re-fetch it and return the cached one
-                (entry.fetched_at.elapsed() < self.fetch_backoff && ttl > now)
-            })
+        let cached_token = |state: &CacheState<T>| {
+            let entry = state.entry.as_ref()?;
+            let now = Instant::now();
+            let valid = entry.token.expiry.is_none_or(|expiry| {
+                expiry.saturating_duration_since(now) > self.min_ttl
+                    || (expiry > now && entry.fetched_at.elapsed() < self.fetch_backoff)
+            });
+            valid.then(|| entry.token.token.clone())
         };
-
-        if let Some(cache) = self.cache.read().await.as_ref()
-            && is_token_valid(cache)
-        {
-            return Ok(cache.token.token.clone());
+        if let Some(token) = cached_token(&self.cache.read()) {
+            return Ok(token);
         }
 
-        let mut guard = Arc::clone(&self.cache).write_owned().await;
-        if let Some(cache) = guard.as_ref()
-            && is_token_valid(cache)
-        {
-            // Refresh race
-            return Ok(cache.token.token.clone());
-        }
+        let guard = loop {
+            let mut finished = {
+                let mut state = self.cache.write();
+                if let Some(token) = cached_token(&state) {
+                    return Ok(token);
+                }
+                if let Some(refreshing) = &state.refreshing {
+                    refreshing.subscribe()
+                } else {
+                    state.refreshing = Some(watch::channel(()).0);
+                    break RefreshGuard(Arc::clone(&self.cache));
+                }
+            };
+            let _ = finished.changed().await;
+        };
 
         let fetch = f();
         let refresh_timeout = self.refresh_timeout;
@@ -153,10 +177,11 @@ impl<T: Clone + Send + Sync + 'static> TokenCache<T> {
                     source: Box::new(source),
                 })??;
             let token = cached.token.clone();
-            *guard = Some(CacheEntry {
+            guard.0.write().entry = Some(CacheEntry {
                 token: cached,
                 fetched_at: Instant::now(),
             });
+            drop(guard);
             Ok(token)
         };
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -239,7 +264,7 @@ mod test {
         cache.get_or_insert_with(get_token).await.unwrap();
         assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
 
-        cache.cache.write().await.as_mut().unwrap().fetched_at =
+        cache.cache.write().entry.as_mut().unwrap().fetched_at =
             Instant::now() - cache.fetch_backoff;
         cache.get_or_insert_with(get_token).await.unwrap();
         assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
@@ -259,7 +284,7 @@ mod test {
             .await
             .unwrap()
             .unwrap();
-        assert!(cache.cache.try_read().is_err());
+        assert!(cache.cache.read().refreshing.is_some());
         let mut request = if drop_request {
             drop(request);
             None
@@ -288,6 +313,62 @@ mod test {
             refresh_survives_suspended_request(false),
             refresh_survives_suspended_request(true),
         );
+    }
+
+    #[tokio::test]
+    async fn suspended_waiter_allows_next_refresh() {
+        let cache = TokenCache::<String>::default();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut first = Box::pin(cache.get_or_insert_with(|| async move {
+            released.await.unwrap();
+            Ok::<_, crate::Error>(create_token(Some(Duration::ZERO)))
+        }));
+        assert!(first.as_mut().now_or_never().is_none());
+
+        let mut waiter = Box::pin(cache.get_or_insert_with::<_, _, crate::Error>(|| async {
+            panic!("the suspended waiter should reuse the next token")
+        }));
+        assert!(waiter.as_mut().now_or_never().is_none());
+        release.send(()).unwrap();
+        first.await.unwrap();
+
+        let next = cache.get_or_insert_with(|| async { Ok::<_, crate::Error>(create_token(None)) });
+        let token = tokio::time::timeout(TEST_WAIT_TIMEOUT, next)
+            .await
+            .expect("an unpolled waiter blocked the next credential refresh")
+            .unwrap();
+        assert_eq!(waiter.await.unwrap(), token);
+    }
+
+    #[tokio::test]
+    async fn active_waiter_retries_after_failure_while_another_waiter_is_suspended() {
+        let cache = TokenCache::<String>::default();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut first = Box::pin(cache.get_or_insert_with(|| async move {
+            released.await.unwrap();
+            Err::<TemporaryToken<String>, _>(crate::Error::Generic {
+                store: "test",
+                source: "credential endpoint unavailable".into(),
+            })
+        }));
+        assert!(first.as_mut().now_or_never().is_none());
+        let mut suspended = Box::pin(cache.get_or_insert_with::<_, _, crate::Error>(|| async {
+            panic!("suspended waiter started a fetch")
+        }));
+        assert!(suspended.as_mut().now_or_never().is_none());
+        let mut retry = Box::pin(
+            cache.get_or_insert_with(|| async { Ok::<_, crate::Error>(create_token(None)) }),
+        );
+        assert!(retry.as_mut().now_or_never().is_none());
+
+        release.send(()).unwrap();
+        let err = first.await.unwrap_err();
+        assert!(err.to_string().contains("credential endpoint unavailable"));
+        let token = tokio::time::timeout(TEST_WAIT_TIMEOUT, retry)
+            .await
+            .expect("active waiter could not retry")
+            .unwrap();
+        assert_eq!(suspended.await.unwrap(), token);
     }
 
     async fn refresh_timeout_releases_cache(drop_request: bool) {
